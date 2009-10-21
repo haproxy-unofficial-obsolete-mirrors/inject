@@ -122,11 +122,22 @@
 #define MINTIME(old, new)	(((new)<0)?(old):(((old)<0||(new)<(old))?(new):(old)))
 #define SETNOW(a)		(*a=now)
 
+/* a local IP addresses list */
+struct local_ip {
+    struct in_addr addr;
+    u_int16_t *freeports; /* ports in host byte order */
+    int size; /* number of allocatable ports + 1 */
+    int reserved; /* # of reserved ports (preallocated) */
+    int get, put; /* indexes of where to get and put a free port. Empty if get == put */
+    struct local_ip *next;
+};
+
 /* un objet dont le fd est -1 est inactif */
 struct pageobj {
     struct pageobj *next;
     struct page *page;
     struct sockaddr_in addr;
+    u_int16_t local_port; /* local port in host byte order. 0 if not assigned. */
     int fd;
     char *buf;
     char *read;
@@ -156,6 +167,7 @@ struct client {
     struct timeval expire;
     struct page *current;
     struct scnpage *pages;
+    struct local_ip *addr; /* NULL if automatically assigned */
     char *username;
     char *password;
     char *cookie;
@@ -196,6 +208,7 @@ int arg_slowstart = 0;
 int arg_stattime = STATTIME;
 int arg_maxsock = 1000;
 char *arg_scnfile = NULL;
+char *arg_sourceaddr = NULL;
 int arg_random_delay = 0;
 static int arg_timeout = 0;
 static int arg_log = 0, arg_abs_time = 0;
@@ -212,6 +225,9 @@ int nbactcli=0;
 int shmid=0;
 char *shmaddr=NULL;
 
+/* set to the local_ip list if required */
+static struct local_ip *local_ip_list = NULL;
+static struct local_ip *next_ip = NULL;
 
 /* stats[0] = global. stats[x]=per thread */
 struct stats {
@@ -523,6 +539,67 @@ struct page *newpage(struct scnpage *scn, struct client *client) {
     return page;
 }
 
+
+/* finds an IP with at least <nbports> free ports. Returns a pointer to the
+ * structure with the pre-reserved ports, or NULL if not found.
+ */
+static inline struct local_ip *get_free_ip(int nbports) {
+    struct local_ip *orig = next_ip;
+
+    do {
+	if (!next_ip)
+	    next_ip = local_ip_list;
+
+	if (next_ip->size - next_ip->reserved >= nbports) {
+	    next_ip->reserved += nbports;
+	    orig = next_ip;
+	    next_ip = next_ip->next;
+	    return orig;
+	}
+	next_ip = next_ip->next;
+    } while (next_ip != orig);
+    return NULL;
+}
+
+/* frees the ip */
+static inline void put_free_ip(struct local_ip *ip, int nbports) {
+    ip->reserved -= nbports;
+}
+
+/* returns a free port from the ip address <ip>, or 0 if none or if <ip> is NULL.
+ * The port is in host byte order.
+ */
+static inline u_int16_t get_free_port(struct local_ip *ip, int offset) {
+    u_int16_t port;
+
+    if (!ip)
+	return 0;
+
+    //fprintf(stderr,"%s:%d - entering\n", __FUNCTION__, __LINE__);
+
+    port = 0;
+    if (ip->get != ip->put) {
+	port = ip->freeports[ip->get++] + offset;
+	if (ip->get >= ip->size)
+	    ip->get = 0;
+    }
+    //fprintf(stderr,"%s:%d - leaving : %d\n", __FUNCTION__, __LINE__, port);
+    return port;
+}
+
+/* frees the host byte order port <p> into the <ip> list. Does nothing if
+ * called with port 0, or NULL ip.
+ */
+static inline void put_free_port(struct local_ip *ip, u_int16_t p, int offset) {
+    if (!p || !ip)
+	return;
+    //fprintf(stderr,"%s:%d - entering with %d,%d\n", __FUNCTION__, __LINE__, p, offset);
+    ip->freeports[ip->put++] = p - offset;
+    if (ip->put >= ip->size)
+	ip->put = 0;
+    //fprintf(stderr,"%s:%d - leaving\n", __FUNCTION__, __LINE__);
+}
+
 /* tente de rajouter les fetchs non initiés pour une page donnée.
    renvoie 0 si le client a été supprimé suite à une erreur.
    renvoie 1 si le fetch a correctement été initié, et 2 s'il a échoué (manque de ressources)
@@ -532,6 +609,7 @@ struct page *newpage(struct scnpage *scn, struct client *client) {
 
     while ((obj = page->objecttostart) != NULL) {
 	int fd;
+	obj->local_port = 0;
 	if (nbconn+arg_maxobj >= arg_maxsock ||
 	    page->actobj >= arg_maxobj) { /* on ne peut pas démarrer le fetch tout de suite */
 
@@ -550,19 +628,39 @@ struct page *newpage(struct scnpage *scn, struct client *client) {
 	    //	    return 0; /* killed client */
 	    return 2;
 	}
-	
+
+	if (page->client->addr) {
+	    if ((obj->local_port = get_free_port(page->client->addr, thr-1)) != 0) {
+		struct sockaddr_in local_addr;
+
+		local_addr.sin_addr = page->client->addr->addr;
+		local_addr.sin_port = htons(obj->local_port);
+		local_addr.sin_family = AF_INET;
+
+		/* if bind fails, let's the system do its own work */
+		if (bind(fd, (struct sockaddr *)&local_addr, sizeof local_addr) == -1) {
+		    put_free_port(page->client->addr, obj->local_port, thr-1);
+		    obj->local_port = 0;
+		}
+	    }
+	}
+
 	if ((setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (char *) &one, sizeof(one)) == -1) ||
 	    (fcntl(fd, F_SETFL, O_NONBLOCK)==-1)) {
 	    fprintf(stderr,"impossible de mettre la socket en O_NONBLOCK\n");
 	}
 	if ((connect(fd, (struct sockaddr *)&obj->addr, sizeof(obj->addr)) == -1) && (errno != EINPROGRESS)) {
 	    if (errno == EAGAIN) { /* plus de ports en local -> réessayer plus tard */
+		put_free_port(page->client->addr, obj->local_port, thr-1);
+		obj->local_port = 0;
 		close(fd);
 		return 2;
 	    }
 	    else if (errno != EALREADY && errno != EISCONN) {
 		//		fprintf(stderr,"impossible de faire le connect() pour le fd %d, errno ) %d. destruction du client.\n",
 		//			fd, errno);
+		put_free_port(page->client->addr, obj->local_port, thr-1);
+		obj->local_port = 0;
 		close(fd);
 		destroyclient(page->client, NULL); /* renvoie un pointeur sur le suivant */
 		return 0; /* killed client */
@@ -633,6 +731,10 @@ int newclient(char *username, char *password) {
     if (password != NULL)
     	newclient->password=strdup(password);
 
+    newclient->addr = NULL;
+    if (local_ip_list)
+	newclient->addr = get_free_ip(arg_maxobj);
+
     newclient->pages = firstscnpage;
     newclient->current = newpage(newclient->pages, newclient);
     nbactcli++;
@@ -662,6 +764,8 @@ void destroypage(struct page *page) {
 	int fd = obj->fd;
 	nextobj = obj->next;
 	if (fd > 0) {
+	    put_free_port(page->client->addr, obj->local_port, thr-1);
+	    obj->local_port = 0;
 	    close(fd);
 	    nbconn--;
 	    stats[thr].aborted++;
@@ -708,6 +812,8 @@ void destroyclient(struct client *client, struct client *prev) {
 	}
 	prev->next = client->next;
     }
+    if (client->addr)
+	put_free_ip(client->addr, arg_maxobj);
     if (client->cookie)
 	free(client->cookie);
     if (client->password)
@@ -1078,6 +1184,8 @@ void SelectRun() {
 			  && (!FD_ISSET(fd, WriteEvent) || !EventWrite(fd)))
 			  continue;
 
+		      put_free_port(fdtab[fd]->page->client->addr, fdtab[fd]->local_port, thr-1);
+		      fdtab[fd]->local_port = 0;
 		      close(fd);
 		      nbconn--;
 		      fdtab[fd]->page->objleft--;
@@ -1596,6 +1704,78 @@ int EventRead(int fd) {
     return 0;
 }
 
+/* Takes an ip/port range in the form ip1[-ip2][:p1-p2][,...] and completes or
+ * initializes the local_ip_list from this. Returns 1 if OK, 0 if error.
+ * Ports are incremented by <step>.
+ * The string is destroyed during the process.
+ */
+int build_local_ip(char *range, int step) {
+    char *colon;
+    char *dash;
+    char *coma;
+
+    struct in_addr ip1, ip2;
+    int port1, port2;
+    int ip, port;
+
+    struct local_ip *cur_ip, **list_end;
+
+    while (range && *range) {
+	coma = strchr(range, ',');
+	if (coma)
+	    *coma++ = 0;
+
+	colon = strchr(range, ':');
+	if (colon)
+	    *colon++ = 0;
+
+	dash = strchr(range, '-');
+	if (dash)
+	    *dash++ = 0;
+
+	if (!inet_aton(range, &ip1))
+	    return 0;
+
+	if (dash) {
+	    if (!inet_aton(dash, &ip2))
+		return 0;
+	} else
+	    ip2 = ip1;
+
+	if (colon) {
+	    dash = strchr(colon, '-');
+	    if (!dash)
+		return 0;
+	    *dash++ = 0;
+	    port1 = atol(colon);
+	    port2 = atol(dash);
+	} else {
+	    port1 = 16384;
+	    port2 = 49151;
+	}
+
+	list_end = &local_ip_list;
+	while (*list_end != NULL)
+	    list_end = &(*list_end)->next;
+
+	for (ip = ntohl(ip1.s_addr); ip <= ntohl(ip2.s_addr); ip ++) {
+	    cur_ip = (struct local_ip *)calloc(1, sizeof (struct local_ip));
+	    if (cur_ip == NULL)
+		return 0;
+	    cur_ip->addr.s_addr = htonl(ip);
+	    cur_ip->size = 1 + (port2 - port1 + 1) / step;
+	    // we want 1 more free port in the list
+	    cur_ip->freeports = (u_int16_t *)malloc(sizeof(u_int16_t) * cur_ip->size);
+	    cur_ip->put = cur_ip->get = 0;
+	    for (port = port1; port <= port2 + 1 - step; port += step)
+		cur_ip->freeports[cur_ip->put++] = port;
+	    *list_end = cur_ip;
+	    list_end = &cur_ip->next;
+	}
+	range = coma;
+    }
+    return local_ip_list != NULL;
+}
 
 /* returns 0 if OK, -1 if error */
 int readscnfile(char *file) {
@@ -1621,7 +1801,7 @@ void usage() {
     fprintf(stderr,
 	    "Syntaxe : inject -u <users> -f <scnfile> [ -i <iter> ] [ -d <duration> ] [ -l ]\n"
 	    "          [ -r ] [ -t <timeout> ] [ -n <maxsock> ] [ -o <maxobj> ] [ -a ]\n"
-	    "          [ -s <starttime> ] [ -w <waittime> ] [ -p nbprocs ]\n"
+	    "          [ -s <starttime> ] [ -w <waittime> ] [ -p nbprocs ] [ -S ip-ip:p-p ]*\n"
 	    "          [ -H \"<header>\" ]* [ -T <thinktime> ] [ -G <URL> ] [ -P <nbpages> ]\n"
 	    "- users    : nombre de clients simultanes (=nb d'instances du scenario)\n"
 	    "- iter     : nombre maximal d'iterations a effectuer par client\n"
@@ -1695,6 +1875,7 @@ int main(int argc, char **argv) {
 		case 'G' : arg_geturl = *argv; break;
 		case 'P' : arg_nbpages = atol(*argv); break;
 		case 'T' : arg_thinktime = atol(*argv); break;
+		case 'S' : arg_sourceaddr = *argv; break;
 		case 'H' :
 		    if (global_headers != NULL) {
 			char *ptr;
@@ -1736,14 +1917,23 @@ int main(int argc, char **argv) {
     else
 	fprintf(stderr,"Warning: cannot verify if system will accept %d sockets\n", arg_maxsock+3);
 
+    
+    /* we'll step through the number of processes so that each process gets different ports */
+    if (arg_sourceaddr) {
+	char *source = strdup(arg_sourceaddr);
+	if (!build_local_ip(source, arg_nbprocs))
+	    usage();
+	free(source);
+    }
 
     if (arg_geturl) {  /* URI on command line */
 	int curpage, curobj;
 	int nbpages = arg_nbpages;
-	if (!nbpages)
-	    nbpages = 10;
 	char curhost[256];
 	char *uri, *args;
+
+	if (!nbpages)
+	    nbpages = 10;
 
 	/* look for the '/' starting the URI */
 	uri = strchr(arg_geturl, '/');
