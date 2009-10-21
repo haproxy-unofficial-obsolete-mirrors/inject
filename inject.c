@@ -110,7 +110,13 @@
  * time that is needed by select() to collect all events. All timeouts
  * are rounded up by adding this value prior to pass it to select().
  */
-#define SCHEDULER_RESOLUTION	9
+// 100 HZ
+//#define SCHEDULER_RESOLUTION	9
+// 250 HZ
+//#define SCHEDULER_RESOLUTION	3
+
+// trade off CPU for better accuracy
+#define SCHEDULER_RESOLUTION	0
 
 /* show stats this every millisecond, 0 to disable */
 #define STATTIME	1000
@@ -212,6 +218,7 @@ int arg_maxsock = 1000;
 char *arg_scnfile = NULL;
 char *arg_sourceaddr = NULL;
 int arg_random_delay = 0;
+int arg_regular_time = 0;
 static int arg_timeout = 0;
 static int arg_log = 0, arg_abs_time = 0;
 static int arg_maxtime = 0;
@@ -699,6 +706,14 @@ int start_client(struct client *cli) {
     cli->status = STATUS_RUN;
     if (arg_timeout > 0)
 	tv_delayfrom(&cli->expire, &now, arg_timeout);
+
+    if (arg_regular_time) {
+	/* will be needed later to compute next start time */
+	cli->nextevent = now;
+	// it's important to get the real time and not the cycle time if we
+	// want to spread the load
+	//tv_now(&cli->nextevent);
+    }
 
     if ((page = cli->current) == NULL) /* fin des pages pour ce client */
 	return 1;
@@ -1727,7 +1742,14 @@ int EventRead(int fd) {
 		// Log(LOG_LDEBUG,"[Event] dernier objet de la page, mise en veille du client.\n");
 		obj->page->client->hits++;
 		//		/*tv_now*/SETNOW(&obj->page->end);
-		tv_delayfrom(&obj->page->client->nextevent, &now, obj->page->thinktime);
+		if (arg_regular_time) {
+		    /* we want the next fetch to start a certain time after the start of the previous one */
+		    tv_delayfrom(&obj->page->client->nextevent,
+				 &obj->page->client->nextevent,
+				 obj->page->thinktime);
+		}
+		else
+		    tv_delayfrom(&obj->page->client->nextevent, &now, obj->page->thinktime);
 		if (obj->page->client->status != STATUS_ERROR) {
 		    obj->page->client->status = obj->page->status = STATUS_THINK;
 		    stats[thr].stat_ptime += tv_delta(&obj->page->begin, &now);
@@ -1847,10 +1869,11 @@ void sighandler(int sig) {
 
 void usage() {
     fprintf(stderr,
+	    "Inject29 - simple HTTP load generator (C) 2000-2005 Willy Tarreau <w@w.ods.org>\n"
 	    "Syntaxe : inject -u <users> -f <scnfile> [-i <iter>] [-d <duration>] [-l] [-r]\n"
 	    "          [-t <timeout>] [-n <maxsock>] [-o <maxobj>] [-a] [-s <starttime>]\n"
 	    "          [-C <cli_at_once>] [-w <waittime>] [-p nbprocs] [-S ip-ip:p-p]*\n"
-	    "          [-H \"<header>\"]* [-T <thinktime>] [-G <URL>] [-P <nbpages>]\n"
+	    "          [-H \"<header>\"]* [-T <thinktime>] [-G <URL>] [-P <nbpages>] [-R]\n"
 	    "- users    : nombre de clients simultanes (=nb d'instances du scenario)\n"
 	    "- iter     : nombre maximal d'iterations a effectuer par client\n"
 	    "- waittime : temps (en ms) entre deux affichages des stats (0=jamais)\n"
@@ -1860,7 +1883,7 @@ void usage() {
 	    "- duration : duree maximale du test (en secondes)\n"
 	    "- maxobj   : nombre maximal d'objets en cours de lecture par client\n"
 	    "- maxsock  : nombre maximal de sockets utilisees\n"
-	    "- [ -r ]   : ajoute 10%% de random sur le thinktime\n"
+	    "- [ -r ]   : ajoute 10%% de random sur le thinktime ; -R = regular think time.\n"
 	    "- [ -l ]   : passe en format de logs (plus large, pas de repetition de legende)\n"
 	    "- [ -a ]   : affiche la date absolue (uniquement avec -l)\n"
 	    "Ex: inject -H \"Host: www\" -T 1000 -G \"10.0.0.1:80/\" -o 4 -u 1\n"
@@ -1901,6 +1924,8 @@ int main(int argc, char **argv) {
 		arg_log = 1;
 	    else if (*flag == 'r')
 		arg_random_delay = 1;
+	    else if (*flag == 'R')
+		arg_regular_time = 1;
 	    else if (*flag == 'a')
 		arg_abs_time = 1;
 	    else { /* 2+ args */
