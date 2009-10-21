@@ -1,17 +1,37 @@
 /* 2000/11/18 : correction du SEGV.
  * 2000/11/21 : grand nettoyage de l'automate et correction de nombreux bugs.
+ * 2000/11/22 : ajout des time-outs, erreurs, temps par hit et par page.
  *
- * Obs : parfois l'injecteur se bloque s'il y a peu de client. strace montre
- *       que c'est parce qu'un connect() n'aboutit pas. Sans doute une table
+ * inject7
+ *
+ * Obs : parfois l'injecteur se bloque vers le serveur sizesrv, s'il y a peu
+ *	 de clients. strace montre que c'est parce qu'un connect() n'aboutit
+ *       pas. C'est maintenant rattrapé par le timeout. Sans doute une table
  *       de sockets qui se fige quelque part, ou un bug sur l'OS :-(
  *       Voir la trace à la fin de ce fichier.
  *
  * TODO :
  *  - réécrire en gérant des files d'attente suivant l'état des clients.
  *  - gérer les unités d'affichage
- *  - passer les data en long long
- *  - traiter un timeout sur inactivité d'un client.
- *  - terminaison automatique (et brutale) de l'injection au bout d'une durée
+ *
+ * Détail des affichages :
+ *  time delta clients    hits ^hits hits/s  ^h/s     bytes   ^bytes  kB/s  last  errs  tout htime ptime
+ *
+ * - time est le nombre de millisecondes écoulées depuis le début du test
+ * - delta est le temps en millisecondes depuis le dernier affichage
+ * - clients est le nombre total de clients ayant déroulé un scénario (avec ou sans erreurs)
+ * - hits est le nombre total de hits réussis (=sans erreur) depuis le début du test
+ * - ^hits est le nombre de hits réussis depuis le dernier affichage
+ * - hits/s est le nombre moyen de hits par seconde depuis le début du test
+ * - ^h/s est le nombre moyen de hits par seconde depuis le dernier affichage
+ * - bytes est le nombre total d'octets lus depuis le début du test
+ * - ^bytes est le nombre d'octets recus depuis le dernier affichage
+ * - kB/s est le débit moyen depuis le début du test, en kilooctets par seconde
+ * - ^k/s est le débit moyen depuis le dernier affichage, en ko/s
+ * - errs est le nombre d'erreurs (déconnexions ...) depuis le début du test
+ * - tout est le nombre de timeouts depuis le début du test
+ * - htime donne l'évolution du temps moyen d'un hit (en ms)
+ * - ptime donne l'évolution du temps moyen de chargement d'une page avec tous ses objets (en ms)
  *
  */
 
@@ -53,8 +73,11 @@
 #define	INTBITS		5
 
 #define MINTIME(old, new)	(((new)<0)?(old):(((old)<0||(new)<(old))?(new):(old)))
+#define SETNOW(a)		(*a=now)
 
 struct pageobj {
+    struct pageobj *next;
+    struct page *page;
     struct sockaddr_in addr;
     int fd;
     char *buf;
@@ -63,22 +86,24 @@ struct pageobj {
     char *uri;
     char *vars;
     char *host;
-    struct pageobj *next;
-    struct page *page;
+    struct timeval starttime;
 };
 
 struct page {
+    struct page *next;
     struct pageobj *objects;
+    struct client *client;
     struct timeval begin, end;
     int objleft;
     int thinktime;
     int status;
     int dataread;
-    struct page *next;
-    struct client *client;
 };
 
 struct client {
+    struct client *next;
+    struct timeval nextevent;
+    struct timeval expire;
     struct page *pages;
     struct page *current;
     char *username;
@@ -87,8 +112,6 @@ struct client {
     int status;
     int dataread;
     int hits;
-    struct timeval nextevent;
-    struct client *next;
 };
 
 struct scnobj {
@@ -120,13 +143,23 @@ static struct timeval now={0,0};
 int nbconn=0;
 int clientid=0;
 int nbactcli=0;
-long int totalread=0;
-long int totalhits=0;
+unsigned long long int totalread=0;
+unsigned long int totalhits=0;
+unsigned long int totalerr=0;
+unsigned long int totaltout=0;
+unsigned long int stat_htime=0, stat_hits=0;
+unsigned long int stat_ptime=0, stat_pages=0;
+float moy_htime = 0.0, moy_ptime = 0.0;
+
 char trash[16384];
 char *scnfile = NULL;
 static struct timeval starttime = {0,0};
+static struct timeval stoptime = {0,0};
 int maxfd = 0;
 int stopnow = 0;
+
+static int timeout = 0;
+static int benchtime = 0;
 
 static struct pageobj *fdtab[MAXNBFD];
 
@@ -166,14 +199,14 @@ int Abort(char *fmt, ...) {
 
 
 /* sets <tv> to the current time */
-struct timeval *tv_now(struct timeval *tv) {
+static inline struct timeval *tv_now(struct timeval *tv) {
     if (tv)
 	gettimeofday(tv, NULL);
     return tv;
 }
 
 /* adds <ms> ms to <from>, set the result to <tv> and returns a pointer <tv> */
-struct timeval *tv_delayfrom(struct timeval *tv, struct timeval *from, int ms) {
+static inline struct timeval *tv_delayfrom(struct timeval *tv, struct timeval *from, int ms) {
   if (!tv || !from)
     return NULL;
   tv->tv_usec = from->tv_usec + (ms%1000)*1000;
@@ -185,21 +218,8 @@ struct timeval *tv_delayfrom(struct timeval *tv, struct timeval *from, int ms) {
   return tv;
 }
 
-/* sets tv to now + <ms> ms, and returns a pointer to the newly filled struct */
-struct timeval *tv_wait(struct timeval *tv, int ms) {
-  if (!tv)
-    return NULL;
-  gettimeofday(tv, NULL);
-  tv->tv_usec += (ms%1000)*1000;
-  tv->tv_sec  += (ms/1000);
-  while (tv->tv_usec >= 1000000) {
-    tv->tv_usec -= 1000000;
-    tv->tv_sec++;
-  }
-}
-
 /* compares <tv1> and <tv2> : returns 0 if equal, -1 if tv1 < tv2, 1 if tv1 > tv2 */
-int tv_cmp(struct timeval *tv1, struct timeval *tv2) {
+static inline int tv_cmp(struct timeval *tv1, struct timeval *tv2) {
   if (tv1->tv_sec > tv2->tv_sec)
     return 1;
   else if (tv1->tv_sec < tv2->tv_sec)
@@ -346,7 +366,10 @@ void start_client(struct client *cli) {
     struct pageobj *obj;
 
     cli->status = STATUS_RUN;
-    if ((page = cli->current) == NULL) /* rien à ajouter */
+    if (timeout > 0)
+	tv_delayfrom(&cli->expire, &now, timeout);
+
+    if ((page = cli->current) == NULL) /* fin des pages pour ce client */
 	return;
 
     obj=page->objects;
@@ -356,8 +379,9 @@ void start_client(struct client *cli) {
 	    destroyclient(cli); /* renvoie un pointeur sur le suivant */
 	    return;
 	}
-	else
+	else {
 	    nbconn++;
+	}
 	
 	if (fcntl(obj->fd, F_SETFL, O_NONBLOCK)==-1) {
 	    fprintf(stderr,"impossible de mettre la socket en O_NONBLOCK\n");
@@ -368,6 +392,7 @@ void start_client(struct client *cli) {
 	    return;
 	}
 	else {
+	    SETNOW(&obj->starttime);
 	    fdtab[obj->fd]=obj;
 	    FD_SET(obj->fd, StaticWriteEvent);
 	    
@@ -377,7 +402,8 @@ void start_client(struct client *cli) {
 	obj=obj->next;
 	page->objleft++;
     }
-    /* le client est démarré */
+    SETNOW(&page->begin);
+    /* le client est (re)démarré */
 }
 
 
@@ -402,6 +428,7 @@ void newclient(char *username, char *password) {
     newclient->next = clients;
     newclient->cookie = NULL;
     newclient->current = newclient->pages;
+
     start_client(clients = newclient);
 }
 
@@ -468,29 +495,50 @@ int stats(void *arg) {
 	static lines;
 	static struct timeval nextevt;
 	static unsigned long lasthits;
-	static unsigned long lastread;
+	static unsigned long long lastread;
 	static struct timeval lastevt;
 	unsigned long totaltime, deltatime;
 	if (tv_cmp(&now, &nextevt) >= 0) {
 		deltatime = (tv_delta(&now, &lastevt)?:1);
 		totaltime = (tv_delta(&now, &starttime)?:1);
-		if (lines++ % 16 == 0)
-		fprintf(stderr,"\n   time +delta clients    hits +delta hits/s  last     bytes +   delta  kB/s  last\n");
 
-		if (lines>1)
-			fprintf(stderr,"%7ld +%5ld %7ld %7ld +%5ld  %5ld %5ld %9ld +%8ld %5ld %5ld\n",
+		
+		if (stat_hits)
+		    moy_htime = 0.8 * moy_htime + ((moy_htime == 0.0) ? 1.0 : 0.2) * (float)stat_htime/(float)stat_hits;
+
+		if (stat_pages)
+		    moy_ptime = 0.8 * moy_ptime + ((moy_ptime == 0.0) ? 1.0 : 0.2) * (float)stat_ptime/(float)stat_pages;
+
+
+		if (lines++ % 16 == 0)
+		    fprintf(stderr,
+			    "\n   time delta clients    hits ^hits"
+			    " hits/s  ^h/s     bytes   ^bytes  kB/s"
+			    "  last  errs  tout htime ptime\n");
+
+		if (lines>1) {
+			fprintf(stderr,"%7ld %5ld %7ld %7ld %5ld  %5ld %5ld %9lld %8lld %5ld %5ld %5ld %5ld %03.1f %03.1f\n",
 				totaltime, deltatime,
 				iterations,
-				totalhits, totalhits-lasthits,
+				totalhits, stat_hits/*totalhits-lasthits*/,
 				totalhits*1000/totaltime,
-				(totalhits-lasthits)*1000/deltatime,
+				stat_hits/*(totalhits-lasthits)*/*1000/deltatime,
 				totalread, totalread-lastread,
-				totalread/totaltime, (totalread-lastread)/deltatime);
-		
+				(long)(totalread/(unsigned long long)totaltime),
+				(long)((totalread-lastread)/(unsigned long long)deltatime),
+				totalerr, totaltout,
+				moy_htime, moy_ptime);
+		}
+
 		tv_delayfrom(&nextevt, &now, STATTIME);
 		lasthits=totalhits;
 		lastread=totalread;
 		lastevt=now;
+		stat_hits = stat_htime = 0;
+		stat_pages = stat_ptime = 0;
+
+		if (benchtime > 0 && tv_cmp(&stoptime, &now) < 0)
+		    stopnow=1;  /* bench must terminate now */
 	}	
 	return tv_remain(&now, &nextevt);
 }
@@ -549,7 +597,20 @@ int scheduler(void *arg) {
 	nextcli = cli->next;
 
 	if (cli->status == STATUS_RUN) {
-	    continue;
+	    unsigned int del2;
+	    if (timeout == 0)
+		continue;
+
+	    if ((del2 = tv_remain(&now, &cli->expire)) > 0) {
+		if (del2 < delay)
+		    delay = del2;
+		continue;
+	    }
+	    else {
+		totaltout++;
+		destroyclient(cli);
+		continue;
+	    }
 	}
 	else if (cli->status == STATUS_THINK) {
 	    unsigned int del2;
@@ -573,6 +634,7 @@ int scheduler(void *arg) {
 	    }
 	}
 	else if ((cli->status == STATUS_ERROR) && (cli->current->objleft == 0)) {
+	    totalerr++;
 	    destroyclient(cli);
 	    continue;
 	}
@@ -584,12 +646,20 @@ int scheduler(void *arg) {
 	onemoreclient();
     }
 
+#if 0 /* can never be called because of the statement just above */
     if ((nbactcli == 0) && (iterations == nbiterations)) {
 	int deltatime = (tv_delta(&now, &starttime)?:1);
-	printf("Fin: %ld clients ont généré %ld hits et chargé %ld octets en %ld ms soit %ld kB/s et %ld hits/s.\n",
-	    iterations, totalhits, totalread, deltatime, totalread/deltatime, totalhits*1000/deltatime);
+	printf("\nFin.\nClients : %ld\nHits    : %ld\nOctets  : %lld\nDuree   : %ld ms\n"
+	       "Debit   : %lld kB/s\nReponse : %ld hits/s\n"
+	       "Erreurs : %ld\nTimeouts: %ld\n"
+	       "Temps moyen de hit: %3.1f ms\n"
+	       "Temps moyen d'une page complete: %3.1f ms\n",
+	       iterations, totalhits, totalread, deltatime,
+	       totalread/(unsigned long long)deltatime, totalhits*1000/deltatime,
+	       totalerr, totaltout, moy_htime, moy_ptime);
 	exit(0);
     }
+#endif
 
     tv_delayfrom(&next, &now, delay);
 
@@ -651,6 +721,7 @@ int SelectRun() {
 		    NULL,
 		    (next_time >= 0) ? &delta : NULL);
       
+      tv_now(&now);
       if (status > 0) { /* Appeller les events */
 
 	  int fds;
@@ -820,8 +891,10 @@ int EventWrite(int fd) {
     struct pageobj *obj;
     int data, ldata;
 
-
     obj = fdtab[fd];
+
+    if (timeout > 0)
+	tv_delayfrom(&obj->page->client->expire, &now, timeout);
 
     ldata=sizeof(data);
     getsockopt(fd, SOL_SOCKET, SO_ERROR, &data, &ldata);
@@ -861,7 +934,7 @@ int EventWrite(int fd) {
 	else {
 	    if (errno != EAGAIN) {
 		fprintf(stderr,"[Event] erreur sur le write().\n");
-		tv_now(&obj->page->end);
+		/*tv_now*/SETNOW(&obj->page->end);
 		obj->page->client->status = obj->page->status = STATUS_ERROR;
 		return 1;
 	    }
@@ -870,7 +943,7 @@ int EventWrite(int fd) {
     }
     else { /* erreur sur la socket */
 	fprintf(stderr,"[Event] erreur sur le connect() : %d\n",data);
-	tv_now(&obj->page->end);
+	/*tv_now*/SETNOW(&obj->page->end);
 	obj->page->client->status = obj->page->status = STATUS_ERROR;
 	return 1;
     }
@@ -887,6 +960,9 @@ int EventRead(int fd) {
 
     obj = fdtab[fd];
 
+    if (timeout > 0)
+	tv_delayfrom(&obj->page->client->expire, &now, timeout);
+
     do {
 	moretoread = 0;
 	if (obj->buf + BUFSIZE <= obj->read)  /* on ne stocke pas les data dépassant le buffer */
@@ -899,7 +975,7 @@ int EventRead(int fd) {
 
 	if (ret>0) {
 	    if ((starttime.tv_sec | starttime.tv_usec) == 0)  /* la premiere fois, on démarre le chrono */
-		tv_now(&starttime);
+		/*tv_now*/SETNOW(&starttime);
 
 	    obj->page->dataread+=ret;
 	    obj->page->client->dataread+=ret;
@@ -909,6 +985,11 @@ int EventRead(int fd) {
 	else if (ret == 0) {
 	    char *ptr1, *ptr2, *cookie, *ptr3;
 	    char *header;
+
+	    /* on relève les mesures le plus tôt possible */
+	    stat_htime += tv_delta(&obj->starttime, &now);
+	    stat_hits ++;
+
 	    /* lire les headers pour savoir s'il y a un cookie */
 	    ptr1 = obj->buf;
 	    while (ptr1 < obj->read) {
@@ -977,10 +1058,12 @@ int EventRead(int fd) {
 	    if (obj->page->objleft == 1) {  /* dernier objet de cette page */
 		// Log(LOG_LDEBUG,"[Event] dernier objet de la page, mise en veille du client.\n");
 		obj->page->client->hits++;
-		tv_now(&obj->page->end);
-		tv_wait(&obj->page->client->nextevent, obj->page->thinktime);
+		/*tv_now*/SETNOW(&obj->page->end);
+		tv_delayfrom(&obj->page->client->nextevent, &now, obj->page->thinktime);
 		if (obj->page->client->status != STATUS_ERROR) {
 		    obj->page->client->status = obj->page->status = STATUS_THINK;
+		    stat_ptime += tv_delta(&obj->page->begin, &now);
+		    stat_pages ++;
 		}
 	    }
 	    else {
@@ -993,6 +1076,7 @@ int EventRead(int fd) {
 	else if ((ret == -1) && (errno != EAGAIN)) {
 	    // Log(LOG_LDEBUG,"[Event] erreur, arrêt du client <%p>.\n", obj->page->client);
 	    obj->page->client->status = STATUS_ERROR;
+	    //	    printf("erreur = %d\n",errno);
 	    return 1;
 	}
     } while (moretoread);
@@ -1028,8 +1112,14 @@ int main(int argc, char **argv) {
 	fprintf(stderr,"Erreur: recompiler avec pour que sizeof(int)=%d\n",sizeof(int)*8);
 	exit(1);
     }
-    if (argc != 5) {
-	fprintf(stderr,"Syntaxe : inject <nbusers> <nbiterations> <injectdelay> <scnfile>\n"
+    if (argc < 5) {
+	fprintf(stderr,"Syntaxe : inject <users> <iter> <injdly> <scn> [<tout> [<stop>]]\n"
+		"- users : nombre de clients simultanes (=nb d'instances du scenario).\n"
+		"- iter  : nombre maximal d'iterations a effectuer par client.\n"
+		"- injdly: temps (en ms) d'incrementation du nb de clients (montee en charge).\n"
+		"- scn   : nom du fichier de scénario a utiliser.\n"
+		"- tout  : timeout (en ms) sur un objet avant destruction du client.\n"
+		"- stop  : duree maximale du test (en secondes).\n"
 		"Le fichier de scenario a pour syntaxe :\n"
 		"host addr:port\n"
 		"new pageXXX <think time en ms>\n"
@@ -1043,6 +1133,10 @@ int main(int argc, char **argv) {
     nbiterations = atol(argv[2]) * reqclients;
     injectdelay = atol(argv[3]);
     scnfile = argv[4];
+    if (argc > 5)
+	timeout = atol(argv[5]);
+    if (argc > 6)
+	benchtime = atol(argv[6]);
 
     if (readscnfile(scnfile) < 0) {
 	fprintf(stderr, "[inject] Error reading scn file : %s\n", scnfile);
@@ -1054,19 +1148,30 @@ int main(int argc, char **argv) {
     bzero(fdtab, sizeof(fdtab));
 
     signal(SIGINT, sighandler);
+
+    tv_now(&now);
+    tv_delayfrom(&stoptime, &now, benchtime * 1000);
+
     SelectRun();
 
     tv_now(&now);
+
     deltatime = (tv_delta(&now, &starttime)?:1);
-    printf("Fin: %ld clients ont généré %ld hits et chargé %ld octets en %ld ms soit %ld kB/s et %ld hits/s.\n",
-	   iterations, totalhits, totalread, deltatime, totalread/deltatime, totalhits*1000/deltatime);
+    printf("\nFin.\nClients : %ld\nHits    : %ld\nOctets  : %lld\nDuree   : %ld ms\n"
+	   "Debit   : %lld kB/s\nReponse : %ld hits/s\n"
+	   "Erreurs : %ld\nTimeouts: %ld\n"
+	   "Temps moyen de hit: %3.1f ms\n"
+	   "Temps moyen d'une page complete: %3.1f ms\n",
+	   iterations, totalhits, totalread, deltatime,
+	   totalread/(unsigned long long)deltatime, totalhits*1000/deltatime,
+	   totalerr, totaltout, moy_htime, moy_ptime);
     return 0;
 }
 
 
 /*
  * Trace du probleme du connect().
- * Injecteur sur un kernel 2.4.0test11, serveur sur un 2.2.18-22wt4.
+ * Injecteur <inject6> sur un kernel 2.4.0test11, serveur <sizesrv> sur un 2.2.18-22wt4.
  * --> Voir la socket 4 : elle ne se débloque jamais.
  *
  * socket(PF_INET, SOCK_STREAM, IPPROTO_TCP) = 4
