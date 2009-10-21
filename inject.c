@@ -18,6 +18,10 @@
  *              Le temps cumulé affiché est désormais "-1" tant que l'injection n'a pas
  *              pu démarrer.
  * 2001/08/10 : correction de l'arret premature et ajout de la ligne de commande dans les logs.
+ * 2002/02/04 : correction d'un nouveau bug dans la gestion des headers, et affinage de la
+ *              gestion mémoire pour tenter de faire tenir plus d'utilisateurs.
+ *		Il faudrait refaire la partie serveur (voir haproxy) pour libérer les headers
+ *		aussitôt que possible, et lire les data à la volée.
  *
  * Remarque : le champ "variables" HTTP peut contenir 2 "%s" qui seront remplacés par l'id du client
  *            et son mot de passe (=id)
@@ -440,9 +444,10 @@ static inline struct pageobj *newobj(char methode, char *host, struct sockaddr_i
 	obj->vars = NULL;
 
     obj->next	= NULL;
+    obj->buf	= NULL;
     obj->page	= page;
     //    obj->read = obj->buf = (char *)malloc(BUFSIZE);
-    obj->read = obj->buf = (char *)alloc_pool(buffer);
+    //    obj->read = obj->buf = (char *)alloc_pool(buffer);
 
     return obj;
 }
@@ -501,8 +506,8 @@ struct page *newpage(struct scnpage *scn, struct client *client) {
 	    return 2;
 	}
 	
-	if ((fcntl(fd, F_SETFL, O_NONBLOCK)==-1) ||
-	    (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (char *) &one, sizeof(one)) == -1)) {
+	if ((setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (char *) &one, sizeof(one)) == -1) ||
+	    (fcntl(fd, F_SETFL, O_NONBLOCK)==-1)) {
 	    fprintf(stderr,"impossible de mettre la socket en O_NONBLOCK\n");
 	}
 	if ((connect(fd, &obj->addr, sizeof(obj->addr)) == -1) && (errno != EINPROGRESS)) {
@@ -624,8 +629,9 @@ void destroypage(struct page *page) {
 		}
 	}
 	if (obj->vars)
-		free_pool(str, obj->vars);
-	free_pool(buffer, obj->buf);
+		free_pool(vars, obj->vars);
+	if (obj->buf)
+		free_pool(buffer, obj->buf);
 	free_pool(pageobj, obj);
 	obj=nextobj;
     }
@@ -914,6 +920,7 @@ void SelectRun() {
 
       if (next_time >= 0) {
 	  /* Convert to timeval */
+	  next_time += 1; /* to avoid fast loops due to timeouts */
 	  delta.tv_sec=next_time/1000; 
 	  delta.tv_usec=(next_time%1000)*1000;
       }
@@ -1009,7 +1016,7 @@ struct scnobj *newscnobj(int meth, char *host, char *uri, char *vars) {
     obj->meth = meth;
     obj->host = strdup(host);
     obj->uri = strdup(uri);
-    obj->vars = (vars == NULL) ? NULL : strdup(vars);
+    obj->vars = (vars == NULL) ? NULL : strdup(vars);  // pas plutot alloc_pool(vars) ?
 
     if (curscnobj == NULL)
 	curscnpage->objects = obj;
@@ -1170,7 +1177,12 @@ int EventWrite(int fd) {
 	    else
 		r+=sprintf(r,"\r\n");
 	}
-	
+
+	/* a ce stade, obj->vars ne devrait plus servir */
+	if (obj->vars) {
+		free_pool(vars, obj->vars);
+ 		obj->vars = NULL;
+	}
 	/* la requete est maintenant prete */
 	if (write(fd, req, strlen(req)) != -1) {
 	    FD_SET(fd, StaticReadEvent);
@@ -1209,6 +1221,10 @@ int EventRead(int fd) {
 
     do {
 	moretoread = 0;
+	if (obj->buf == NULL) { /* pas encore alloué */
+	    obj->read = obj->buf = (char *)alloc_pool(buffer);
+	}
+
 	if (obj->buf + BUFSIZE <= obj->read)  /* on ne stocke pas les data dépassant le buffer */
 	    ret=read(fd, trash, sizeof(trash));  /* lire les data mais ne pas les stocker */
 	else {
