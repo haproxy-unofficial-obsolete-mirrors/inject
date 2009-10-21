@@ -1,5 +1,5 @@
 /*
- * inject10
+ * inject11
  *
  * 2000/11/18 : correction du SEGV.
  * 2000/11/21 : grand nettoyage de l'automate et correction de nombreux bugs.
@@ -12,6 +12,11 @@
  * 2001/03/02 : ajout de headers personnalisés
  * 2001/08/07 : heure de demarrage dans les logs, affichage toutes les secondes.
  *              correction d'un bug sur l'allocation des variables
+ * 2001/08/09 : Affinage du delai d'affichage des stats à la milliseconde. Ce
+ *              temps devient paramétrable par l'option "-w".
+ *              Le démarrage en douceur fonctionne bien, même pour des petits délais.
+ *              Le temps cumulé affiché est désormais "-1" tant que l'injection n'a pas
+ *              pu démarrer.
  * Remarque : le champ "variables" HTTP peut contenir 2 "%s" qui seront remplacés par l'id du client
  *            et son mot de passe (=id)
  *
@@ -163,6 +168,7 @@ unsigned long int nbclients=0;
 unsigned int arg_maxobj = 8;
 unsigned long int arg_maxiter=0;
 int arg_slowstart = 0;
+int arg_stattime = STATTIME;
 int arg_maxsock = 1000;
 char *arg_scnfile = NULL;
 int arg_random_delay = 0;
@@ -656,7 +662,12 @@ void destroyclient(struct client *client, struct client *prev) {
     nbactcli--;
 
     while (nbactcli < nbclients) {
-	if (onemoreclient() == 0) {
+	if ((arg_maxiter > 0) && (iterations >= arg_maxiter)) {
+		if (nbactcli == 0)
+			stopnow = 1;
+		break;
+	}
+	else if (onemoreclient() == 0) {
 	    break; /* si ret==0, plus possible d'injecter à cause d'erreurs */
 	}
     }
@@ -670,11 +681,17 @@ int stats(void *arg) {
 	static unsigned long lasthits;
 	static unsigned long long lastread;
 	static struct timeval lastevt;
-	unsigned long totaltime, deltatime;
-	if (tv_cmp_ms(&now, &nextevt) >= 0) {
-		deltatime = (tv_delta(&now, &lastevt)?:1);
-		totaltime = (tv_delta(&now, &starttime)?:1);
+	long totaltime, deltatime;
 
+	if ((nextevt.tv_sec | nextevt.tv_usec) == 0)
+	    tv_now(&nextevt);
+
+	if (tv_cmp(&now, &nextevt) >= 0) {
+		deltatime = (tv_delta(&now, &lastevt)?:1);
+		if ((starttime.tv_sec | starttime.tv_usec) == 0)
+		    totaltime = -1;
+		else
+		    totaltime = (tv_delta(&now, &starttime)?:1);
 		
 		if (stat_hits)
 		    moy_htime = 0.8 * moy_htime + ((moy_htime == 0.0) ? 1.0 : 0.2) * (float)stat_htime/(float)stat_hits;
@@ -712,14 +729,17 @@ int stats(void *arg) {
 				totalerr, totaltout,
 				moy_htime, moy_ptime);
 		}
-		else if (arg_log) {  /* print it once */
-		    fprintf(stderr,
-			    "   time delta clients    hits ^hits"
-			    " hits/s  ^h/s     bytes   ^bytes  kB/s"
-			    "  last  errs  tout htime ptime nbcli\n");
+		else if (arg_log) { /* print it once */
+				    fprintf(stderr,
+					    "   time delta clients    hits ^hits"
+					    " hits/s  ^h/s     bytes   ^bytes  kB/s"
+					    "  last  errs  tout htime ptime nbcli\n");
 		}
-
-		tv_delayfrom(&nextevt, &now, STATTIME);
+		if (totaltime > 0)
+		    deltatime = totaltime % arg_stattime; /* correct imprecision */
+		else
+		    deltatime = 0;
+		tv_delayfrom(&nextevt, &now, arg_stattime - deltatime);
 		lasthits=totalhits;
 		lastread=totalread;
 		lastevt=now;
@@ -727,7 +747,7 @@ int stats(void *arg) {
 		stat_pages = stat_ptime = 0;
 
 		if ((arg_maxtime > 0 && tv_cmp_ms(&stoptime, &now) < 0)
-		    || (arg_maxiter > 0 && iterations > arg_maxiter))
+		    /*|| (arg_maxiter > 0 && iterations > arg_maxiter)*/)
 		    stopnow=1;  /* bench must terminate now */
 	}	
 	return tv_remain(&now, &nextevt);
@@ -738,21 +758,37 @@ int stats(void *arg) {
 */
 static inline int injecteur(void *arg) {
     static struct timeval next;
+    unsigned long delay;
 
-    if ((arg_maxiter > 0) && (iterations == arg_maxiter)) /* c'est la fin, on ne veut plus injecter */
+    if ((arg_maxiter > 0) && (iterations >= arg_maxiter)) /* c'est la fin, on ne veut plus injecter */
 	return -1;
 
-    /* ajoute tout ce qui manque tant qu'on peut le faire */
+    if (nbclients < arg_nbclients) {
+	unsigned long times;
+
+	if ((next.tv_sec | next.tv_usec) == 0)
+	    tv_now(&next);
+
+	if (arg_slowstart == 0)
+	    nbclients = arg_nbclients; /* no soft start, all clients at once */
+	else {
+	    times = tv_remain(&next, &now) / arg_slowstart; /* client needed during elapsed time since last visiting */
+	    if (times > 0) {
+		tv_delayfrom(&next, &next, (times + 1) * arg_slowstart); /* decrement remaining time, but delay it for 1 iteration */
+		nbclients += times;
+		if (nbclients > arg_nbclients)
+		    nbclients = arg_nbclients;
+	    }
+	    delay = tv_remain(&now, &next);
+	}
+    }
+    else
+	delay = -1;
+
+    /* try to get as many clients as required */
     while ((nbactcli < nbclients) && (onemoreclient() != 0));
 
-    if (tv_cmp_ms(&next, &now) > 0)  /* on ne doit pas encore créer de nouveau client */
-	return tv_remain(&now, &next);
-
-    if (nbclients < arg_nbclients)
-	nbclients++;
-
-    tv_delayfrom(&next, &now, arg_slowstart);
-    return arg_slowstart;
+    return delay;
 }
 
 
@@ -850,7 +886,7 @@ void SelectRun() {
   struct timeval delta;
   int readnotnull, writenotnull;
 
-  while(!stopnow) {
+  while (!stopnow) {
       next_time = -1;
       tv_now(&now);
 
@@ -862,10 +898,10 @@ void SelectRun() {
       time2 = scheduler(NULL);
       next_time = MINTIME(time2, next_time);
 	  
-#if STATTIME > 0
-      time2 = stats(NULL);
-      next_time = MINTIME(time2, next_time);
-#endif
+      if (arg_stattime > 0) {
+	  time2 = stats(NULL);
+	  next_time = MINTIME(time2, next_time);
+      }
 
       if (next_time >= 0) {
 	  /* Convert to timeval */
@@ -1389,9 +1425,10 @@ void usage() {
     fprintf(stderr,
 	    "Syntaxe : inject -u <users> -f <scnfile> [ -i <iter> ] [ -d <duration> ] [ -l ]\n"
 	    "          [ -r ] [ -t <timeout> ] [ -n <maxsock> ] [ -o <maxobj> ]\n"
-	    "          [ -s <starttime> ]\n"
+	    "          [ -s <starttime> ] [ -w <waittime> ]\n"
 	    "- users    : nombre de clients simultanes (=nb d'instances du scenario)\n"
 	    "- iter     : nombre maximal d'iterations a effectuer par client\n"
+	    "- waittime : temps (en ms) entre deux affichages des stats (0=jamais)\n"
 	    "- starttime: temps (en ms) d'incrementation du nb de clients (montee en charge)\n"
 	    "- scnfile  : nom du fichier de scénario a utiliser\n"
 	    "- timeout  : timeout (en ms) sur un objet avant destruction du client\n"
@@ -1403,8 +1440,8 @@ void usage() {
 	    "Le fichier de scenario a pour syntaxe :\n"
 	    "host addr:port\n"
 	    "new pageXXX <think time en ms>\n"
-	    "\tget . /fichier1.html\n"
-	    "\tget . /fichier2.html\n"
+	    "\t{get|post} {ip:port|.} /fichier1.html var1=val&clientid=%%s&passwd=%%s\n"
+	    "\t{get|post} {ip:port|.} /fichier2.html var2=val&clientid=%%s&passwd=%%s\n"
 	    "new pageYYY <think time ...>\n");
     exit(1);
 }
@@ -1448,6 +1485,7 @@ int main(int argc, char **argv) {
 		case 'n' : arg_maxsock = atol(*argv); break;
 		case 'o' : arg_maxobj = atol(*argv); break;
 		case 's' : arg_slowstart = atol(*argv); break;
+		case 'w' : arg_stattime = atol(*argv); break;
 		default: usage();
 		}
 	    }
