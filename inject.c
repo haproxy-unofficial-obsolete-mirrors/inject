@@ -1136,7 +1136,7 @@ struct scnobj *newscnobj(int meth, char *host, char *uri, char *vars) {
 
 /* returns 0 if OK, -1 if error */
 int parsescnline(char *line) {
-    char *cmd;
+    char *end;
     char *pagename;
     long int time;
     char *srv;
@@ -1146,31 +1146,75 @@ int parsescnline(char *line) {
     char *args[10];
     int arg;
 
+    end = line + strlen(line);
     /* skips leading spaces */
     while (isspace(*line))
 	line++;
 
-    /* cleans up line contents */
-    cmd = line;
-    while (*cmd) {
-	if (*cmd == '#' || *cmd == ';' || *cmd == '\n' || *cmd == '\r')
-	    *cmd = 0; /* end of string, end of loop */
-	else
-	    cmd++;
+
+    arg = 0;
+    args[arg] = line;
+
+    while (*line && arg < sizeof(args)/sizeof(args[0])) {
+	/* first, we'll replace \\, \<space>, \#, \r, \n, \t, \xXX with their
+	 * C equivalent value. Other combinations left unchanged (eg: \1).
+	 */
+	if (*line == '\\') {
+	    int skip = 0;
+	    if (line[1] == ' ' || line[1] == '\\' || line[1] == '#') {
+		*line = line[1];
+		skip = 1;
+	    }
+	    else if (line[1] == 'r') {
+		*line = '\r';
+		skip = 1;
+	    } 
+	    else if (line[1] == 'n') {
+		*line = '\n';
+		skip = 1;
+	    }
+	    else if (line[1] == 't') {
+		*line = '\t';
+		skip = 1;
+	    }
+	    else if (line[1] == 'x' && (line + 3 < end )) {
+		unsigned char hex1, hex2;
+		hex1 = toupper(line[2]) - '0'; hex2 = toupper(line[3]) - '0';
+		if (hex1 > 9) hex1 -= 'A' - '9' - 1;
+		if (hex2 > 9) hex2 -= 'A' - '9' - 1;
+		*line = (hex1<<4) + hex2;
+		skip = 3;
+		} 
+	    if (skip) {
+		memmove(line + 1, line + 1 + skip, end - (line + skip + 1));
+		end -= skip;
+	    }
+	    line++;
+	}
+	else if (*line == '#' || *line == ';' || *line == '\n' || *line == '\r') {
+	    /* end of string, end of loop */
+	    *line = 0;
+	    break;
+	}
+	else if (isspace((int)*line)) {
+	    /* a non-escaped space is an argument separator */
+	    *line++ = 0;
+	    while (isspace((int)*line))
+		line++;
+	    args[++arg] = line;
+	}
+	else {
+	    line++;
+	}
     }
 
-    if (*line == 0)
+    /* empty line */
+    if (!**args)
 	return 0;
 
-    /* fills args with the line contents */
-    for (arg=0; arg<9; arg++) {
+    /* zero out remaining args */
+    while (++arg < sizeof(args)/sizeof(args[0])) {
 	args[arg] = line;
-	while (*line && !isspace(*line)) line++;
-	if (*line) {
-	    *(line++) = 0;
-	    while (isspace(*line))
-		line++;
-	}
     }
 
     if (!strcasecmp(*args, "host")) {  /* host */
