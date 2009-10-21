@@ -1,12 +1,15 @@
-/* 2000/11/18 : correction du SEGV.
+/*
+ * 2000/11/18 : correction du SEGV.
  * 2000/11/21 : grand nettoyage de l'automate et correction de nombreux bugs.
  * 2000/11/22 : ajout des time-outs, erreurs, temps par hit et par page.
  * 2000/11/22 : limitation du nombre de sockets simultanées par client.
  * 2000/11/24 : correction du bug infame lie a la limitation du nombre de FD.
- * 2001/02/26 : ajout du "User-Agent" et du "Connection: Close". Acceptation
+ * 2001/02/26 : ajout du "User-Agent" et du "Connection: close". Acceptation
  *              des cookies sans "path=/"
  *              TODO: gérer le referer, et controler la longueur des cookies lors des remplacements.
- * inject8
+ * 2001/03/02 : ajout de headers personnalisés
+ *
+ * inject9
  *
  * Obs : parfois l'injecteur se bloque vers le serveur sizesrv, s'il y a peu
  *	 de clients. strace montre que c'est parce qu'un connect() n'aboutit
@@ -81,7 +84,7 @@
 /* sur combien de bits code-t-on la taille d'un entier (ex: 32bits -> 5) */
 #define	INTBITS		5
 
-#define	USER_AGENT	"inject8"
+#define	USER_AGENT	"Mozilla/4.0.(compatible; MSIE 4.01; Windows)"
 
 #define MINTIME(old, new)	(((new)<0)?(old):(((old)<0||(new)<(old))?(new):(old)))
 #define SETNOW(a)		(*a=now)
@@ -149,7 +152,7 @@ struct scnobj  *curscnobj = NULL;
 char curscnhost[64]="host not set !";
 
 struct client *clients = NULL;
-
+char *global_headers = NULL;
 
 unsigned long int arg_nbclients=0;
 unsigned long int nbclients=0;
@@ -1005,10 +1008,36 @@ int parsescnline(char *line) {
 	}
     }
 
-    if (**args == 'H' || **args == 'h') {  /* host */
+    if (!strcasecmp(*args, "host")) {  /* host */
 	if (isalnum(*args[1])) {
 	    strncpy(curscnhost, args[1], sizeof(curscnhost));
 	}
+	return 0;
+    }
+    
+    if (!strcasecmp(*args, "header")) {  /* header */
+	char *ptr, *ptr2;
+	int arg;
+
+	if (global_headers != NULL) {
+	    ptr2 = ptr = (char *)malloc(strlen(global_headers) + 256 + 3);
+	    ptr += sprintf(ptr, "%s%s", global_headers, args[1]);
+	    free(global_headers);
+	}
+	else {
+	    ptr2 = ptr = (char *)malloc(256 + 1);
+	    ptr += sprintf(ptr, "%s", args[1]);
+	}
+	global_headers = ptr2;
+	arg=2;
+	while (arg<9 && *args[arg]) {
+	    ptr += sprintf(ptr, " %s", args[arg]);
+	    arg++;
+	}
+	*(ptr++) = '\r';
+	*(ptr++) = '\n';
+	*(ptr++) = '\0';
+
 	return 0;
     }
     
@@ -1047,7 +1076,7 @@ int parsescnline(char *line) {
 
 /*** retourne 0 si OK, 1 si on doit fermer le FD ***/
 int EventWrite(int fd) {
-    char req[2048];
+    char req[4096];
     char *r = req;
     struct pageobj *obj;
     int data, ldata;
@@ -1069,20 +1098,19 @@ int EventWrite(int fd) {
 	    r+=sprintf(r," HTTP/1.0\r\n");
 	    if (obj->page->client->cookie)
 		r+=sprintf(r, "Cookie: %s\r\n", obj->page->client->cookie);
-	    r+=sprintf(r, "Host: %s\r\n", obj->host);
-	    r+=sprintf(r, "User-Agent: " USER_AGENT "\r\n");
-	    r+=sprintf(r, "Connection: Close\r\n");
-	    r+=sprintf(r,"\r\n");
+	    if (global_headers)
+		r+=sprintf(r, "%s", global_headers);
+	    r+=sprintf(r, "Host: %s\r\nUser-Agent: " USER_AGENT "\r\nConnection: close\r\n\r\n", obj->host);
 	}
 	else { /* meth = METH_POST */
 	    r+=sprintf(r, "POST %s HTTP/1.0\r\n", obj->uri);
-	    r+=sprintf(r, "Host: %s\r\n", obj->host);
-	    r+=sprintf(r, "User-Agent: " USER_AGENT "\r\n");
-	    r+=sprintf(r, "Connection: Close\r\n");
+	    r+=sprintf(r, "Host: %s\r\nUser-Agent: " USER_AGENT "\r\nConnection: close\r\n", obj->host);
 	    r+=sprintf(r, "Content-Type: application/x-www-form-urlencoded\r\n");
 
 	    if (obj->page->client->cookie)
 		r+=sprintf(r, "Cookie: %s\r\n", obj->page->client->cookie);
+	    if (global_headers)
+		r+=sprintf(r, "%s", global_headers);
 	    if (obj->vars) {		
 		r+=sprintf(r,"Content-length: %d\r\n",strlen(obj->vars));
 		r+=sprintf(r,"\r\n");
@@ -1115,7 +1143,6 @@ int EventWrite(int fd) {
 	obj->page->client->status = obj->page->status = STATUS_ERROR;
 	return 1;
     }
-
 }
 
 
@@ -1473,7 +1500,7 @@ int main(int argc, char **argv) {
 	   "Temps moyen de hit: %3.1f ms\n"
 	   "Temps moyen d'une page complete: %3.1f ms\n",
 	   iterations, totalhits, totalread, deltatime,
-	   totalread/(unsigned long long)deltatime, totalhits*1000/deltatime,
+	   totalread/(unsigned long long)deltatime, (unsigned long)((unsigned long long)totalhits*1000ULL/deltatime),
 	   totalerr, totaltout, moy_htime, moy_ptime);
     return 0;
 }
