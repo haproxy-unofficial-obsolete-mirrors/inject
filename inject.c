@@ -1,4 +1,6 @@
 /*
+ * inject10
+ *
  * 2000/11/18 : correction du SEGV.
  * 2000/11/21 : grand nettoyage de l'automate et correction de nombreux bugs.
  * 2000/11/22 : ajout des time-outs, erreurs, temps par hit et par page.
@@ -8,8 +10,10 @@
  *              des cookies sans "path=/"
  *              TODO: gérer le referer, et controler la longueur des cookies lors des remplacements.
  * 2001/03/02 : ajout de headers personnalisés
- *
- * inject9
+ * 2001/08/07 : heure de demarrage dans les logs, affichage toutes les secondes.
+ *              correction d'un bug sur l'allocation des variables
+ * Remarque : le champ "variables" HTTP peut contenir 2 "%s" qui seront remplacés par l'id du client
+ *            et son mot de passe (=id)
  *
  * Obs : parfois l'injecteur se bloque vers le serveur sizesrv, s'il y a peu
  *	 de clients. strace montre que c'est parce qu'un connect() n'aboutit
@@ -76,10 +80,10 @@
 #define OBJ_STTERM	-2
 
 #define BUFSIZE		4096
-#define TRASHSIZE	4096
+#define TRASHSIZE	65536
 
 /* show stats this every millisecond, 0 to disable */
-#define STATTIME	2000
+#define STATTIME	1000
 
 /* sur combien de bits code-t-on la taille d'un entier (ex: 32bits -> 5) */
 #define	INTBITS		5
@@ -417,7 +421,12 @@ static inline struct pageobj *newobj(char methode, char *host, struct sockaddr_i
 
     obj->uri = uri;
     obj->host = host;
-    obj->vars = vars;
+    if (vars) {
+	obj->vars = (char *)alloc_pool(str);
+	strcpy(obj->vars, vars);
+    }
+    else
+	obj->vars = NULL;
 
     obj->next	= NULL;
     obj->page	= page;
@@ -432,7 +441,7 @@ struct page *newpage(struct scnpage *scn, struct client *client) {
     struct page *page;
     struct pageobj **obj;
     struct scnobj *scnobj;
-    char variables[256];
+    char variables[sizeof_str];
 
     //    page=(struct page *)calloc(1, sizeof(struct page));
     page=(struct page *)alloc_pool(page);
@@ -603,6 +612,8 @@ void destroypage(struct page *page) {
 			maxfd--;
 		}
 	}
+	if (obj->vars)
+		free_pool(str, obj->vars);
 	free_pool(buffer, obj->buf);
 	free_pool(pageobj, obj);
 	obj=nextobj;
@@ -890,7 +901,6 @@ void SelectRun() {
 
 	  int fds;
 	  char count;
-	  char closeit = 0;
 	  
 	  /* test sur les FD en lecture. On les parcourt 32 par 32 pour gagner du temps */
 	  for (fds = 0; (fds << INTBITS) < maxfd; fds++)
@@ -899,29 +909,24 @@ void SelectRun() {
 		      
 		      if (fdtab[fd] == NULL)
 			  continue;
-		      closeit = 0;
 		      
-		      if (!closeit && FD_ISSET(fd, WriteEvent))
-			  closeit |= EventWrite(fd);
+		      if ((!FD_ISSET(fd, WriteEvent) || !EventWrite(fd))
+			  && (!FD_ISSET(fd, ReadEvent) || !EventRead(fd)))
+			  continue;
+
+		      close(fd);
+		      nbconn--;
+		      fdtab[fd]->page->objleft--;
+		      fdtab[fd]->page->actobj--;
+		      FD_CLR(fd, StaticReadEvent);
+		      FD_CLR(fd, StaticWriteEvent);
+		      fdtab[fd]->fd = OBJ_STTERM;
+		      fdtab[fd]=NULL;
 		      
-		      if (!closeit && FD_ISSET(fd, ReadEvent))
-			  closeit |= EventRead(fd);
-		      
-		      if (closeit) {
-			  close(fd);
-			  nbconn--;
-			  fdtab[fd]->page->objleft--;
-			  fdtab[fd]->page->actobj--;
-			  FD_CLR(fd, StaticReadEvent);
-			  FD_CLR(fd, StaticWriteEvent);
-			  fdtab[fd]->fd = OBJ_STTERM;
-			  fdtab[fd]=NULL;
-			  
-			  if (maxfd == fd+1) {   /* recompute maxfd */
-			      while ((fd >= 0) && (fdtab[fd] == NULL))
-				  fd--;
-			      maxfd = fd+1;
-			  }
+		      if (maxfd == fd+1) {   /* recompute maxfd */
+			  while ((fd >= 0) && (fdtab[fd] == NULL))
+			      fd--;
+			  maxfd = fd+1;
 		      }
 		  }
       }
@@ -1095,26 +1100,27 @@ int EventWrite(int fd) {
 	    r+=sprintf(r, "GET %s", obj->uri);
 	    if (obj->vars)
 		r+=sprintf(r,"?%s", obj->vars);
-	    r+=sprintf(r," HTTP/1.0\r\n");
+	    r+=sprintf(r," HTTP/1.0\r\n"
+		       "Host: %s\r\nUser-Agent: " USER_AGENT "\r\n"
+		       "Connection: close\r\n\r\n", obj->host);
 	    if (obj->page->client->cookie)
 		r+=sprintf(r, "Cookie: %s\r\n", obj->page->client->cookie);
 	    if (global_headers)
 		r+=sprintf(r, "%s", global_headers);
-	    r+=sprintf(r, "Host: %s\r\nUser-Agent: " USER_AGENT "\r\nConnection: close\r\n\r\n", obj->host);
 	}
 	else { /* meth = METH_POST */
-	    r+=sprintf(r, "POST %s HTTP/1.0\r\n", obj->uri);
-	    r+=sprintf(r, "Host: %s\r\nUser-Agent: " USER_AGENT "\r\nConnection: close\r\n", obj->host);
-	    r+=sprintf(r, "Content-Type: application/x-www-form-urlencoded\r\n");
+	    r+=sprintf(r,
+		       "POST %s HTTP/1.0\r\n"
+		       "Host: %s\r\nUser-Agent: " USER_AGENT "\r\n"
+		       "Connection: close\r\n"
+		       "Content-Type: application/x-www-form-urlencoded\r\n", obj->uri, obj->host);
 
 	    if (obj->page->client->cookie)
 		r+=sprintf(r, "Cookie: %s\r\n", obj->page->client->cookie);
 	    if (global_headers)
 		r+=sprintf(r, "%s", global_headers);
 	    if (obj->vars) {		
-		r+=sprintf(r,"Content-length: %d\r\n",strlen(obj->vars));
-		r+=sprintf(r,"\r\n");
-		r+=sprintf(r, "%s", obj->vars);
+		r+=sprintf(r,"Content-length: %d\r\n\r\n%s", strlen(obj->vars), obj->vars);
 	    }
 	    else
 		r+=sprintf(r,"\r\n");
@@ -1166,7 +1172,7 @@ int EventRead(int fd) {
 		obj->read += ret;
 	}
 
-	if (ret>0) {
+	if (ret > 0) {
 	    if ((starttime.tv_sec | starttime.tv_usec) == 0)  /* la premiere fois, on démarre le chrono */
 		/*tv_now*/SETNOW(&starttime);
 
@@ -1406,6 +1412,10 @@ void usage() {
 int main(int argc, char **argv) {
     struct rlimit rlim;
     long int deltatime;
+    time_t launch_time;
+    struct tm *tm;
+    char *mois[12]={"Jan","Fev","Mar","Avr","Mai","Juin",
+                    "Juil","Aou","Sep","Oct","Nov","Dec"};
 
     if (1<<INTBITS != sizeof(int)*8) {
 	fprintf(stderr,"Erreur: recompiler avec pour que sizeof(int)=%d\n",sizeof(int)*8);
@@ -1486,6 +1496,7 @@ int main(int argc, char **argv) {
 
     signal(SIGINT, sighandler);
 
+    time(&launch_time); tm=localtime(&launch_time);
     tv_now(&now);
     tv_delayfrom(&stoptime, &now, arg_maxtime * 1000);
 
@@ -1498,10 +1509,15 @@ int main(int argc, char **argv) {
 	   "Debit   : %lld kB/s\nReponse : %ld hits/s\n"
 	   "Erreurs : %ld\nTimeouts: %ld\n"
 	   "Temps moyen de hit: %3.1f ms\n"
-	   "Temps moyen d'une page complete: %3.1f ms\n",
+	   "Temps moyen d'une page complete: %3.1f ms\n"
+	   "Date de demarrage: %ld (%d %s %d - %d:%02d:%02d)\n",
 	   iterations, totalhits, totalread, deltatime,
 	   totalread/(unsigned long long)deltatime, (unsigned long)((unsigned long long)totalhits*1000ULL/deltatime),
-	   totalerr, totaltout, moy_htime, moy_ptime);
+	   totalerr, totaltout,
+           moy_htime, moy_ptime,
+	   (long)launch_time,
+           tm->tm_mday, mois[tm->tm_mon], tm->tm_year+1900,
+           tm->tm_hour, tm->tm_min, tm->tm_sec);
     return 0;
 }
 
