@@ -23,6 +23,7 @@
  *              gestion mémoire pour tenter de faire tenir plus d'utilisateurs.
  *		Il faudrait refaire la partie serveur (voir haproxy) pour libérer les headers
  *		aussitôt que possible, et lire les data à la volée.
+ * 2004/05/14 : ajout de l'option '-a' pour afficher la date absolue.
  *
  * Remarque : le champ "variables" HTTP peut contenir 2 "%s" qui seront remplacés par l'id du client
  *            et son mot de passe (=id)
@@ -188,7 +189,7 @@ int arg_maxsock = 1000;
 char *arg_scnfile = NULL;
 int arg_random_delay = 0;
 static int arg_timeout = 0;
-static int arg_log = 0;
+static int arg_log = 0, arg_abs_time = 0;
 static int arg_maxtime = 0;
 
 static struct timeval now={0,0};
@@ -526,7 +527,7 @@ struct page *newpage(struct scnpage *scn, struct client *client) {
 	    (fcntl(fd, F_SETFL, O_NONBLOCK)==-1)) {
 	    fprintf(stderr,"impossible de mettre la socket en O_NONBLOCK\n");
 	}
-	if ((connect(fd, &obj->addr, sizeof(obj->addr)) == -1) && (errno != EINPROGRESS)) {
+	if ((connect(fd, (struct sockaddr *)&obj->addr, sizeof(obj->addr)) == -1) && (errno != EINPROGRESS)) {
 	    if (errno == EAGAIN) { /* plus de ports en local -> réessayer plus tard */
 		close(fd);
 		return 2;
@@ -733,9 +734,9 @@ int stats(void *arg) {
 			    " hits/s  ^h/s     bytes  kB/s"
 			    "  last  errs  tout htime ptime\n");
 		if (lines>1) {
-		    if (arg_log)
+		    if (arg_log) {
 			fprintf(stdout,"%7ld %5ld %7ld %7ld %5ld  %5ld %5ld %9lld %8lld %5ld %5ld %5ld %5ld %03.1f %03.1f %5d\n",
-				totaltime, deltatime,
+				arg_abs_time ? now.tv_sec + (now.tv_usec >= 500000) : totaltime, deltatime,
 				iterations,
 				totalhits, stat_hits/*totalhits-lasthits*/,
 				(unsigned long)((unsigned long long)totalhits*1000ULL/totaltime),
@@ -745,6 +746,8 @@ int stats(void *arg) {
 				(long)((totalread-lastread)/(unsigned long long)deltatime),
 				totalerr, totaltout,
 				moy_htime, moy_ptime, nbactcli);
+			fflush(stdout);
+		    }
 		    else
 			fprintf(stderr,"%7ld %5ld  %5ld %5ld %9lld %5ld %5ld %5ld %5ld %03.1f %03.1f\n",
 				totalhits, stat_hits/*totalhits-lasthits*/,
@@ -982,8 +985,9 @@ void SelectRun() {
 		      if (fdtab[fd] == NULL)
 			  continue;
 		      
-		      if ((!FD_ISSET(fd, WriteEvent) || !EventWrite(fd))
-			  && (!FD_ISSET(fd, ReadEvent) || !EventRead(fd)))
+		      /* better to free system buffers first */
+		      if ((!FD_ISSET(fd, ReadEvent) || !EventRead(fd))
+			  && (!FD_ISSET(fd, WriteEvent) || !EventWrite(fd)))
 			  continue;
 
 		      close(fd);
@@ -1156,75 +1160,77 @@ int EventWrite(int fd) {
     char req[4096];
     char *r = req;
     struct pageobj *obj;
-    int data, ldata;
+    int data;
 
     obj = fdtab[fd];
 
     if (arg_timeout > 0)
 	tv_delayfrom(&obj->page->client->expire, &now, arg_timeout);
 
-    ldata=sizeof(data);
-    getsockopt(fd, SOL_SOCKET, SO_ERROR, &data, &ldata);
-
-    if (data == 0) {  /* pas d'erreur sur la socket */
-	/* créer la requête */
-	if (obj->meth == METH_GET)  {
-	    r+=sprintf(r, "GET %s", obj->uri);
-	    if (obj->vars)
-		r+=sprintf(r,"?%s", obj->vars);
-	    r+=sprintf(r," HTTP/1.0\r\n"
-		       "Host: %s\r\nUser-Agent: " USER_AGENT "\r\n", obj->host);
-	    if (obj->page->client->cookie)
-		r+=sprintf(r, "Cookie: %s\r\n", obj->page->client->cookie);
-	    if (global_headers)
-		r+=sprintf(r, "%s", global_headers);
-	    r+=sprintf(r, "Connection: close\r\n\r\n");
-	}
-	else { /* meth = METH_POST */
-	    r+=sprintf(r,
-		       "POST %s HTTP/1.0\r\n"
-		       "Host: %s\r\nUser-Agent: " USER_AGENT "\r\n"
-		       "Connection: close\r\n"
-		       "Content-Type: application/x-www-form-urlencoded\r\n", obj->uri, obj->host);
-
-	    if (obj->page->client->cookie)
-		r+=sprintf(r, "Cookie: %s\r\n", obj->page->client->cookie);
-	    if (global_headers)
-		r+=sprintf(r, "%s", global_headers);
-	    if (obj->vars) {		
-		r+=sprintf(r,"Content-length: %d\r\n\r\n%s", strlen(obj->vars), obj->vars);
-	    }
-	    else
-		r+=sprintf(r,"\r\n");
-	}
-
-	/* a ce stade, obj->vars ne devrait plus servir */
-	if (obj->vars) {
-		free_pool(vars, obj->vars);
- 		obj->vars = NULL;
-	}
-	/* la requete est maintenant prete */
-	if (write(fd, req, strlen(req)) != -1) {
-	    FD_SET(fd, StaticReadEvent);
-	    FD_CLR(fd, StaticWriteEvent);
-	    //	    shutdown(fd, SHUT_WR);
-	    return 0;
-	}
-	else {
-	    if (errno != EAGAIN) {
-		//		fprintf(stderr,"[Event] erreur sur le write().\n");
-		//		/*tv_now*/SETNOW(&obj->page->end);
-		obj->page->client->status = obj->page->status = STATUS_ERROR;
-		return 1;
-	    }
-	    return 0;  /* erreur = EAGAIN */
-	}
+    /* créer la requête */
+    if (obj->meth == METH_GET)  {
+	r+=sprintf(r, "GET %s", obj->uri);
+	if (obj->vars)
+	    r+=sprintf(r,"?%s", obj->vars);
+	r+=sprintf(r," HTTP/1.0\r\n"
+		   "Host: %s\r\nUser-Agent: " USER_AGENT "\r\n", obj->host);
+	if (obj->page->client->cookie)
+	    r+=sprintf(r, "Cookie: %s\r\n", obj->page->client->cookie);
+	if (global_headers)
+	    r+=sprintf(r, "%s", global_headers);
+	r+=sprintf(r, "Connection: close\r\n\r\n");
     }
-    else { /* erreur sur la socket */
-	//	fprintf(stderr,"[Event] erreur sur le connect() : %d\n",data);
-	//	/*tv_now*/SETNOW(&obj->page->end);
-	obj->page->client->status = obj->page->status = STATUS_ERROR;
-	return 1;
+    else { /* meth = METH_POST */
+	r+=sprintf(r,
+		   "POST %s HTTP/1.0\r\n"
+		   "Host: %s\r\nUser-Agent: " USER_AGENT "\r\n"
+		   "Connection: close\r\n"
+		   "Content-Type: application/x-www-form-urlencoded\r\n", obj->uri, obj->host);
+	
+	if (obj->page->client->cookie)
+	    r+=sprintf(r, "Cookie: %s\r\n", obj->page->client->cookie);
+	if (global_headers)
+	    r+=sprintf(r, "%s", global_headers);
+	if (obj->vars) {		
+	    r+=sprintf(r,"Content-length: %d\r\n\r\n%s", strlen(obj->vars), obj->vars);
+	}
+	else
+	    r+=sprintf(r,"\r\n");
+    }
+    
+    /* a ce stade, obj->vars ne devrait plus servir */
+    if (obj->vars) {
+	free_pool(vars, obj->vars);
+	obj->vars = NULL;
+    }
+    
+#ifndef MSG_NOSIGNAL
+    {
+	int ldata = sizeof(data);
+	getsockopt(fd, SOL_SOCKET, SO_ERROR, &data, &ldata);
+	if (data)
+	    data = -1;
+	else
+	    data = send(fd, req, r-req, MSG_DONTWAIT);
+    }
+#else
+    data = send(fd, req, r-req, MSG_DONTWAIT | MSG_NOSIGNAL);
+#endif
+    /* la requete est maintenant prete */
+    if (data != -1) {
+	FD_SET(fd, StaticReadEvent);
+	FD_CLR(fd, StaticWriteEvent);
+	//	    shutdown(fd, SHUT_WR);
+	return 0;
+    }
+    else {
+	if (errno != EAGAIN) {
+	    //		fprintf(stderr,"[Event] erreur sur le write().\n");
+	    //		/*tv_now*/SETNOW(&obj->page->end);
+	    obj->page->client->status = obj->page->status = STATUS_ERROR;
+	    return 1;
+	}
+	return 0;  /* erreur = EAGAIN */
     }
 }
 
@@ -1245,10 +1251,18 @@ int EventRead(int fd) {
 	    obj->read = obj->buf = (char *)alloc_pool(buffer);
 	}
 
-	if (obj->buf + BUFSIZE <= obj->read)  /* on ne stocke pas les data dépassant le buffer */
-	    ret=read(fd, trash, sizeof(trash));  /* lire les data mais ne pas les stocker */
-	else {
-	    ret=read(fd, obj->read, BUFSIZE - (obj->read - obj->buf)); /* lire et stocker les data */
+	if (obj->buf + BUFSIZE <= obj->read) { /* on ne stocke pas les data dépassant le buffer */
+#ifndef MSG_NOSIGNAL
+	    ret=recv(fd, trash, sizeof(trash),0);  /* lire les data mais ne pas les stocker */
+#else
+	    ret=recv(fd, trash, sizeof(trash),MSG_NOSIGNAL);  /* lire les data mais ne pas les stocker */
+#endif
+	} else {
+#ifndef MSG_NOSIGNAL
+	    ret=recv(fd, obj->read, BUFSIZE - (obj->read - obj->buf), 0); /* lire et stocker les data */
+#else
+	    ret=recv(fd, obj->read, BUFSIZE - (obj->read - obj->buf), MSG_NOSIGNAL); /* lire et stocker les data */
+#endif
 	    if (ret > 0)
 		obj->read += ret;
 	}
@@ -1469,7 +1483,7 @@ void sighandler(int sig) {
 void usage() {
     fprintf(stderr,
 	    "Syntaxe : inject -u <users> -f <scnfile> [ -i <iter> ] [ -d <duration> ] [ -l ]\n"
-	    "          [ -r ] [ -t <timeout> ] [ -n <maxsock> ] [ -o <maxobj> ]\n"
+	    "          [ -r ] [ -t <timeout> ] [ -n <maxsock> ] [ -o <maxobj> ] [ -a ]\n"
 	    "          [ -s <starttime> ] [ -w <waittime> ]\n"
 	    "- users    : nombre de clients simultanes (=nb d'instances du scenario)\n"
 	    "- iter     : nombre maximal d'iterations a effectuer par client\n"
@@ -1482,6 +1496,7 @@ void usage() {
 	    "- maxsock  : nombre maximal de sockets utilisees\n"
 	    "- [ -r ]   : ajoute 10%% de random sur le thinktime\n"
 	    "- [ -l ]   : passe en format de logs (plus large, pas de repetition de legende)\n"
+	    "- [ -a ]   : affiche la date absolue (uniquement avec -l)\n"
 	    "Le fichier de scenario a pour syntaxe :\n"
 	    "host addr:port\n"
 	    "new pageXXX <think time en ms>\n"
@@ -1518,6 +1533,8 @@ int main(int argc, char **argv) {
 		arg_log = 1;
 	    else if (*flag == 'r')
 		arg_random_delay = 1;
+	    else if (*flag == 'a')
+		arg_abs_time = 1;
 	    else { /* 2+ args */
 		argv++; argc--;
 		if (argc == 0)
