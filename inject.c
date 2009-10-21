@@ -1,5 +1,5 @@
 /*
- * Injecteur HTTP simple - (C) 2000-2005 Willy Tarreau <willy@ant-computing.com>
+ * Injecteur HTTP simple (C) 2000-2005 Willy Tarreau <willy@ant-computing.com>
  * Utilisation et redistribution soumises a la licence GPL.
  *
  * 2000/11/18 : correction du SEGV.
@@ -206,6 +206,7 @@ unsigned int arg_maxobj = 8;
 unsigned long int arg_maxiter=0;
 int arg_nbprocs = 1;
 int arg_slowstart = 0;
+int arg_stepsize = 1; /* #of clients to add every <arg_slowstart> */
 int arg_stattime = STATTIME;
 int arg_maxsock = 1000;
 char *arg_scnfile = NULL;
@@ -217,6 +218,7 @@ static int arg_maxtime = 0;
 
 static int arg_nbpages, arg_thinktime;
 static char *arg_geturl = NULL;
+int active_thread = 0;
 
 static struct timeval now={0,0};
 static int one = 1;
@@ -240,6 +242,7 @@ struct stats {
     unsigned long int iterations;
     unsigned long int stat_hits;
     unsigned long int stat_ptime, stat_pages;
+    unsigned long int nbconn, nbcli;
     double moy_htime, moy_sdhtime, moy_ptime;
     double tot_htime, tot_sqhtime;	/* utilisés pour le calcul de l'écart-type */
 } *stats = NULL;
@@ -859,15 +862,9 @@ int show_stats(void *arg) {
 	    unsigned long int iterations=0;
 	    unsigned long int stat_hits=0;
 	    unsigned long int stat_ptime=0, stat_pages=0;
+	    unsigned long int nbconn=0, nbcli=0;
 	    double tot_htime=0, tot_sqhtime=0;
-
 	    int t;
-	    deltatime = (tv_delta(&now, &lastevt)?:1);
-	    if ((starttime.tv_sec | starttime.tv_usec) == 0)
-		totaltime = -1;
-	    else
-		totaltime = (tv_delta(&now, &starttime)?:1);
-
 
 	    for (t = 1; t <= arg_nbprocs; t++) {
 		unsigned long long int tr1, tr2;
@@ -878,11 +875,13 @@ int show_stats(void *arg) {
 		totalerr   += stats[t].totalerr;
 		totaltout  += stats[t].totaltout;
 		iterations += stats[t].iterations;
-		tot_htime  += stats[t].tot_htime;		    stats[t].tot_htime = 0;
-		tot_sqhtime+= stats[t].tot_sqhtime;	 	    stats[t].tot_sqhtime = 0;
-		stat_ptime += stats[t].stat_ptime;		    stats[t].stat_ptime = 0;
-		stat_hits  += stats[t].stat_hits;		    stats[t].stat_hits = 0;
-		stat_pages += stats[t].stat_pages;		    stats[t].stat_pages = 0;
+		tot_htime  += stats[t].tot_htime;     stats[t].tot_htime = 0;
+		tot_sqhtime+= stats[t].tot_sqhtime;   stats[t].tot_sqhtime = 0;
+		stat_ptime += stats[t].stat_ptime;    stats[t].stat_ptime = 0;
+		stat_hits  += stats[t].stat_hits;     stats[t].stat_hits = 0;
+		stat_pages += stats[t].stat_pages;    stats[t].stat_pages = 0;
+		nbconn     += stats[t].nbconn;        stats[t].nbconn  = 0;
+		nbcli      += stats[t].nbcli;         stats[t].nbcli  = 0;
 		/* try to avoid inter-thread race without any lock */
 		tr2 = stats[t].totalread;
 		if ((tr2 & 0xffffffff) < (tr1 & 0xffffffff)) {
@@ -890,6 +889,17 @@ int show_stats(void *arg) {
 		}
 		totalread += tr2;
 	    }
+
+	    //if (totalhits > 0)
+		if ((starttime.tv_sec | starttime.tv_usec) == 0)  /* la premiere fois, on démarre le chrono */
+		    SETNOW(&starttime);
+
+	    deltatime = (tv_delta(&now, &lastevt)?:1);
+	    if ((starttime.tv_sec | starttime.tv_usec) == 0)
+		totaltime = -1;
+	    else
+		totaltime = (tv_delta(&now, &starttime)?:deltatime);
+
 
 	    stats[0].totalread   = totalread;
 	    stats[0].totalhits   = totalhits;
@@ -900,6 +910,8 @@ int show_stats(void *arg) {
 	    stats[0].tot_htime   = tot_htime;
 	    stats[0].tot_sqhtime = tot_sqhtime;
 	    stats[0].stat_ptime  = stat_ptime;
+	    stats[0].nbconn      = nbconn;
+	    stats[0].nbcli       = nbcli;
 	    stats[0].stat_hits  += stat_hits;
 	    stats[0].stat_pages += stat_pages;
 
@@ -919,32 +931,40 @@ int show_stats(void *arg) {
 	    
 	    if (stats[0].stat_pages)
 		stats[0].moy_ptime = (float)stats[0].stat_ptime/(float)stats[0].stat_pages;
-	    
-	    
-	    if ((lines++ % 16 == 0) && !arg_log)
-		fprintf(stderr,
-			"\n   hits ^hits"
-			" hits/s  ^h/s     bytes  kB/s"
-			"  last  errs  tout htime  sdht ptime\n");
+
+	    if (arg_log) {
+		if (lines == 0)
+		    fprintf(stderr,
+			    "   time delta clients    hits ^hits"
+			    "  hits/s  ^h/s     bytes   ^bytes  kB/s"
+			    "  last  errs  tout htime  sdht ptime nbcli nbconn\n");
+	    } else {
+		if (lines % 16 == 0)
+		    fprintf(stderr,
+			    "\n   hits ^hits"
+			    " hits/s  ^h/s     bytes  kB/s"
+			    "  last  errs  tout htime  sdht ptime\n");
+	    }
+	    lines++;
 
 	    if (lines>1) {
 		if (arg_log) {
-		    fprintf(stdout,"%7ld %5ld %7ld %7ld %5ld  %5ld %5ld %9lld %8lld %5ld %5ld %5ld %5ld %03.1f %3.1f %03.1f %5d\n",
+		    fprintf(stdout,"%7ld %5ld %7ld %7ld %5ld  %5ld %5ld %9lld %8lld %5ld %5ld %5ld %5ld %03.1f %3.1f %03.1f %5d %6d\n",
 			    arg_abs_time ? now.tv_sec + (now.tv_usec >= 500000) : totaltime, deltatime,
 			    stats[0].iterations,
-			    stats[0].totalhits, stats[0].stat_hits/*totalhits-lasthits*/,
+			    stats[0].totalhits, stats[0].stat_hits,
 			    (unsigned long)((unsigned long long)stats[0].totalhits*1000ULL/totaltime),
-			    stats[0].stat_hits/*(totalhits-lasthits)*/*1000/deltatime,
+			    stats[0].stat_hits*1000/deltatime,
 			    stats[0].totalread, stats[0].totalread-lastread,
 			    (long)(stats[0].totalread/(unsigned long long)totaltime),
 			    (long)((stats[0].totalread-lastread)/(unsigned long long)deltatime),
 			    stats[0].totalerr, stats[0].totaltout,
-			    stats[0].moy_htime, stats[0].moy_sdhtime, stats[0].moy_ptime, nbactcli);
+			    stats[0].moy_htime, stats[0].moy_sdhtime, stats[0].moy_ptime, stats[0].nbcli, stats[0].nbconn);
 		} else {
 		    fprintf(stderr,"%7ld %5ld  %5ld %5ld %9lld %5ld %5ld %5ld %5ld %03.1f %3.1f %03.1f\n",
-			    stats[0].totalhits, stats[0].stat_hits/*totalhits-lasthits*/,
+			    stats[0].totalhits, stats[0].stat_hits,
 			    (unsigned long)((unsigned long long)stats[0].totalhits*1000ULL/totaltime),
-			    stats[0].stat_hits/*(totalhits-lasthits)*/*1000/deltatime,
+			    stats[0].stat_hits*1000/deltatime,
 			    stats[0].totalread,
 			    (long)(stats[0].totalread/(unsigned long long)totaltime),
 			    (long)((stats[0].totalread-lastread)/(unsigned long long)deltatime),
@@ -952,36 +972,33 @@ int show_stats(void *arg) {
 			    stats[0].moy_htime, stats[0].moy_sdhtime, stats[0].moy_ptime);
 		}
 	    }
-	    else if (arg_log) { /* print it once */
-		fprintf(stderr,
-			"   time delta clients    hits ^hits  hits/s  ^h/s     bytes   ^bytes  kB/s  last  errs  tout htime  sdht ptime nbcli\n");
-	    }
-		
-			if (totaltime > 0)
-			    deltatime = arg_stattime - totaltime % arg_stattime; /* correct imprecision */
-			else
-			    deltatime = arg_stattime;
+	    
+	    if (totaltime > 0)
+		deltatime = arg_stattime - totaltime % arg_stattime;   /* correct imprecision */
+	    else
+		deltatime = arg_stattime;
 		    
-		if (deltatime < arg_stattime/2) /* avoid too short time */
-		    deltatime += arg_stattime;
+	    if (deltatime < arg_stattime/2) /* avoid too short time */
+		deltatime += arg_stattime;
 
-		tv_delayfrom(&nextevt, &now, deltatime);
-		lasthits=stats[0].totalhits;
-		lastread=stats[0].totalread;
-		lastevt=now;
-		stats[0].stat_hits  = 0;
-		stats[0].stat_pages = stats[0].stat_ptime = 0;
-		stats[0].tot_htime = stats[0].tot_sqhtime = 0;
+	    tv_delayfrom(&nextevt, &now, deltatime);
+	    lasthits=stats[0].totalhits;
+	    lastread=stats[0].totalread;
+	    lastevt=now;
+	    stats[0].stat_hits  = 0;
+	    stats[0].stat_pages = stats[0].stat_ptime = 0;
+	    stats[0].tot_htime = stats[0].tot_sqhtime = 0;
 
-		if ((arg_maxtime > 0 && tv_cmp_ms(&stoptime, &now) < 0)
-		    /*|| (arg_maxiter > 0 && stats[0].iterations > arg_maxiter)*/)
-		    stopnow=1;  /* bench must terminate now */
+	    if ((arg_maxtime > 0 && tv_cmp_ms(&stoptime, &now) < 0))
+		stopnow=1;  /* bench must terminate now */
 	}	
-		return tv_remain(&now, &nextevt);
+	return tv_remain(&now, &nextevt);
 }
 
 /* ce scheduler s'occupe d'injecter des clients tant qu'il n'y en a pas assez, mais jamais
-   plus d'un tous les <arg_slowstart> ms
+   plus d'une fois <arg_stepsize> tous les <arg_slowstart> ms. Le principe est que l'on
+   calcule une prochaine date 'next' servant de référence pour le prochain ajout de clients.
+   Les clients sont ajoutés dès que (now-next) > arg_slowstart.
 */
 static inline int injecteur(void *arg) {
     static struct timeval next;
@@ -991,21 +1008,27 @@ static inline int injecteur(void *arg) {
 	return -1;
 
     if (nbclients < arg_nbclients) {
-	unsigned long times;
 
 	if ((next.tv_sec | next.tv_usec) == 0)
-	    tv_now(&next);
+	    SETNOW(&next);
 
 	if (arg_slowstart == 0)
 	    nbclients = arg_nbclients; /* no soft start, all clients at once */
 	else {
-	    times = tv_remain(&next, &now) / arg_slowstart; /* client needed during elapsed time since last visiting */
-	    if (times > 0) {
-		tv_delayfrom(&next, &next, (times + 1) * arg_slowstart); /* decrement remaining time, but delay it for 1 iteration */
-		nbclients += times;
-		if (nbclients > arg_nbclients)
-		    nbclients = arg_nbclients;
+	    if (nbclients == 0) {
+		SETNOW(&next); /* base for next step computation */
+		nbclients += arg_stepsize;
 	    }
+	    else {
+		unsigned long times;
+		times = tv_remain(&next, &now) / arg_slowstart; /* client needed during elapsed time since last visiting */
+		if (times > 0) {
+		    tv_delayfrom(&next, &next, times * arg_slowstart); /* decrement remaining time, but delay it for 1 iteration */
+		    nbclients += times * arg_stepsize;
+		}
+	    }
+	    if (nbclients > arg_nbclients)
+		nbclients = arg_nbclients;
 	    delay = tv_remain(&now, &next);
 	}
     }
@@ -1117,20 +1140,32 @@ void SelectRun() {
       next_time = -1;
       tv_now(&now);
 
-      if (nbactcli < arg_nbclients && !stopnow) {
-	  /* ne pas y aller si ce n'est pas nécessaire */
-	  time2 = injecteur(NULL);
+      if (active_thread) {
+	  if (nbactcli < arg_nbclients && !stopnow) {
+	      /* ne pas y aller si ce n'est pas nécessaire */
+	      time2 = injecteur(NULL);
+	      next_time = MINTIME(time2, next_time);
+	  }
+	  
+	  time2 = scheduler(NULL);
 	  next_time = MINTIME(time2, next_time);
+
+	  if (nbconn > stats[thr].nbconn)
+	      stats[thr].nbconn = nbconn;
+	  if (nbactcli > stats[thr].nbcli)
+	      stats[thr].nbcli = nbactcli;
       }
 	  
-      time2 = scheduler(NULL);
-      next_time = MINTIME(time2, next_time);
-	  
-      /* arg_stattime is forced to zero on thr>1 */
+      /* Note: arg_stattime is forced to zero on thr>1 */
       if (arg_stattime > 0) {
 	  time2 = show_stats(NULL);
 	  next_time = MINTIME(time2, next_time);
+      } else {
+	  /* Other threads must at least check if they have to stop */
+	  if ((arg_maxtime > 0 && tv_cmp_ms(&stoptime, &now) < 0))
+	      stopnow=1;  /* bench must terminate now */
       }
+
 
       if (next_time > 0) {
 	  /* Convert to timeval */
@@ -1148,8 +1183,8 @@ void SelectRun() {
 
 #define FDSET_OPTIM
 #ifndef FDSET_OPTIM
-	memcpy(ReadEvent, StaticReadEvent, sizeof(ReadEvent));
-	memcpy(WriteEvent, StaticWriteEvent, sizeof(WriteEvent));
+      memcpy(ReadEvent, StaticReadEvent, sizeof(ReadEvent));
+      memcpy(WriteEvent, StaticWriteEvent, sizeof(WriteEvent));
       readnotnull = 1; writenotnull = 1;
 #else
       readnotnull = 0; writenotnull = 0;
@@ -1168,7 +1203,6 @@ void SelectRun() {
       
       tv_now(&now);
       if (status > 0) { /* Appeller les events */
-
 	  int fds;
 	  char count;
 	  
@@ -1801,10 +1835,10 @@ void sighandler(int sig) {
 
 void usage() {
     fprintf(stderr,
-	    "Syntaxe : inject -u <users> -f <scnfile> [ -i <iter> ] [ -d <duration> ] [ -l ]\n"
-	    "          [ -r ] [ -t <timeout> ] [ -n <maxsock> ] [ -o <maxobj> ] [ -a ]\n"
-	    "          [ -s <starttime> ] [ -w <waittime> ] [ -p nbprocs ] [ -S ip-ip:p-p ]*\n"
-	    "          [ -H \"<header>\" ]* [ -T <thinktime> ] [ -G <URL> ] [ -P <nbpages> ]\n"
+	    "Syntaxe : inject -u <users> -f <scnfile> [-i <iter>] [-d <duration>] [-l] [-r]\n"
+	    "          [-t <timeout>] [-n <maxsock>] [-o <maxobj>] [-a] [-s <starttime>]\n"
+	    "          [-C <cli_at_once>] [-w <waittime>] [-p nbprocs] [-S ip-ip:p-p]*\n"
+	    "          [-H \"<header>\"]* [-T <thinktime>] [-G <URL>] [-P <nbpages>]\n"
 	    "- users    : nombre de clients simultanes (=nb d'instances du scenario)\n"
 	    "- iter     : nombre maximal d'iterations a effectuer par client\n"
 	    "- waittime : temps (en ms) entre deux affichages des stats (0=jamais)\n"
@@ -1872,6 +1906,7 @@ int main(int argc, char **argv) {
 		case 'n' : arg_maxsock = atol(*argv); break;
 		case 'o' : arg_maxobj = atol(*argv); break;
 		case 's' : arg_slowstart = atol(*argv); break;
+		case 'C' : arg_stepsize = atol(*argv); break;
 		case 'w' : arg_stattime = atol(*argv); break;
 
 		case 'G' : arg_geturl = *argv; break;
@@ -1974,7 +2009,7 @@ int main(int argc, char **argv) {
 	exit(1);
     }
 
-    fprintf(stderr, "Fin de lecture du scénario.\n");
+    //fprintf(stderr, "Fin de lecture du scénario.\n");
 
     ReadEvent = (fd_set *)calloc(1,
 		sizeof(fd_set) *
@@ -2015,19 +2050,24 @@ int main(int argc, char **argv) {
     if (arg_nbprocs > 1) {
 
         for (t = 1; t <= arg_nbprocs; t++) {
-	    if (t > 1) {
-		thr=t;
-	        if (fork() == 0) {
-	            /* only one thread does the stats */
-		    arg_stattime = 0;
-		    SelectRun();
-		    exit(0);
-	        }
+	    thr=t;
+	    if (fork() == 0) {
+		/* those threads don't collect stats */
+		arg_stattime = 0;
+		active_thread=1;
+		SelectRun();
+		exit(0);
 	    }
         }
+	/* the remaining thread does only collect stats */
+	active_thread=0;
+	thr = 0;
     }
-
-    thr = 1;
+    else {
+	/* the only thread does everything */
+	active_thread=1;
+	thr = 1;
+    }
     SelectRun();
     tv_now(&now);
 
