@@ -28,6 +28,7 @@
  * 2005/01/10 : affichage des moyenne et ecart-type des temps de réponse
  * 2005/01/19 : Ne plus démarrer un client si pas assez de FD.
  *		Synthèse des statistiques avant affichage final.
+ * 2005/08/09 : ajout des options -H, -T, -G, -P pour faire le scénario en ligne de commande.
  *
  * Remarque : le champ "variables" HTTP peut contenir 2 "%s" qui seront remplacés par l'id du client
  *            et son mot de passe (=id)
@@ -199,6 +200,9 @@ int arg_random_delay = 0;
 static int arg_timeout = 0;
 static int arg_log = 0, arg_abs_time = 0;
 static int arg_maxtime = 0;
+
+static int arg_nbpages, arg_thinktime;
+static char *arg_geturl = NULL;
 
 static struct timeval now={0,0};
 static int one = 1;
@@ -1617,7 +1621,8 @@ void usage() {
     fprintf(stderr,
 	    "Syntaxe : inject -u <users> -f <scnfile> [ -i <iter> ] [ -d <duration> ] [ -l ]\n"
 	    "          [ -r ] [ -t <timeout> ] [ -n <maxsock> ] [ -o <maxobj> ] [ -a ]\n"
-	    "          [ -s <starttime> ] [ -w <waittime> ] [ -p nbprocs ] \n"
+	    "          [ -s <starttime> ] [ -w <waittime> ] [ -p nbprocs ]\n"
+	    "          [ -H \"<header>\" ]* [ -T <thinktime> ] [ -G <URL> ] [ -P <nbpages> ]\n"
 	    "- users    : nombre de clients simultanes (=nb d'instances du scenario)\n"
 	    "- iter     : nombre maximal d'iterations a effectuer par client\n"
 	    "- waittime : temps (en ms) entre deux affichages des stats (0=jamais)\n"
@@ -1630,6 +1635,7 @@ void usage() {
 	    "- [ -r ]   : ajoute 10%% de random sur le thinktime\n"
 	    "- [ -l ]   : passe en format de logs (plus large, pas de repetition de legende)\n"
 	    "- [ -a ]   : affiche la date absolue (uniquement avec -l)\n"
+	    "Ex: inject -H \"Host: www\" -T 1000 -G \"10.0.0.1:80/\" -o 4 -u 1\n"
 	    "Le fichier de scenario a pour syntaxe :\n"
 	    "host addr:port\n"
 	    "new pageXXX <think time en ms>\n"
@@ -1685,6 +1691,25 @@ int main(int argc, char **argv) {
 		case 'o' : arg_maxobj = atol(*argv); break;
 		case 's' : arg_slowstart = atol(*argv); break;
 		case 'w' : arg_stattime = atol(*argv); break;
+
+		case 'G' : arg_geturl = *argv; break;
+		case 'P' : arg_nbpages = atol(*argv); break;
+		case 'T' : arg_thinktime = atol(*argv); break;
+		case 'H' :
+		    if (global_headers != NULL) {
+			char *ptr;
+			ptr = (char *)malloc(strlen(global_headers) + strlen(*argv) + 3);
+			sprintf(ptr, "%s%s\r\n", global_headers, *argv);
+			free(global_headers);
+			global_headers = ptr;
+		    }
+		    else {
+			char *ptr;
+			ptr = (char *)malloc(strlen(*argv) + 3);
+			sprintf(ptr, "%s\r\n", *argv);
+			global_headers = ptr;
+		    }
+		    break;
 		default: usage();
 		}
 	    }
@@ -1696,7 +1721,7 @@ int main(int argc, char **argv) {
     nbclients = 0;
     arg_maxiter *= arg_nbclients;
 
-    if (!arg_scnfile ||	!arg_nbclients)
+    if ((!arg_geturl && !arg_scnfile) || !arg_nbclients)
 	usage();
 
     if (geteuid() == 0) {
@@ -1711,7 +1736,40 @@ int main(int argc, char **argv) {
     else
 	fprintf(stderr,"Warning: cannot verify if system will accept %d sockets\n", arg_maxsock+3);
 
-    if (readscnfile(arg_scnfile) < 0) {
+
+    if (arg_geturl) {  /* URI on command line */
+	int curpage, curobj;
+	int nbpages = arg_nbpages;
+	if (!nbpages)
+	    nbpages = 10;
+	char curhost[256];
+	char *uri, *args;
+
+	/* look for the '/' starting the URI */
+	uri = strchr(arg_geturl, '/');
+	if (uri == NULL)
+	    uri = arg_geturl + strlen(arg_geturl);
+
+	strncpy(curhost, arg_geturl, uri - arg_geturl);
+
+	/* support host:port without trailing '/' */
+	if (!*uri)
+	    uri = "/";
+
+	args = strchr(uri, '?');
+	if (args)
+	    *args++ = 0;
+
+	for (curpage = 0; curpage < nbpages; curpage++) {
+	    char pagename[20];
+	    snprintf(pagename, sizeof(pagename), "page%09d\n", curpage);
+	    newscnpage(pagename, arg_thinktime);
+
+	    for (curobj = 0; curobj < arg_maxobj; curobj++)
+		newscnobj(METH_GET, curhost, uri, args);
+	}
+    }
+    else if (readscnfile(arg_scnfile) < 0) {
 	fprintf(stderr, "[inject] Error reading scn file : %s\n", arg_scnfile);
 	exit(1);
     }
