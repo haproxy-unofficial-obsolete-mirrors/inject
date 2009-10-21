@@ -1,5 +1,6 @@
 /*
- * inject12
+ * Injecteur HTTP simple - (C) 2000-2002 Willy Tarreau <willy@ant-computing.com>
+ * Utilisation et redistribution soumises a la licence GPL.
  *
  * 2000/11/18 : correction du SEGV.
  * 2000/11/21 : grand nettoyage de l'automate et correction de nombreux bugs.
@@ -337,8 +338,16 @@ static inline int tv_cmp(struct timeval *tv1, struct timeval *tv2) {
  * compares <tv1> and <tv2> modulo 1ms: returns 0 if equal, -1 if tv1 < tv2, 1 if tv1 > tv2
  */
 static inline int tv_cmp_ms(struct timeval *tv1, struct timeval *tv2) {
-    if ((tv1->tv_sec > tv2->tv_sec + 1) ||
-	((tv1->tv_sec == tv2->tv_sec + 1) && (tv1->tv_usec + 1000000 >= tv2->tv_usec + 1000)))
+    if (tv1->tv_sec == tv2->tv_sec) {
+	if (tv1->tv_usec >= tv2->tv_usec + 1000)
+	    return 1;
+	else if (tv2->tv_usec >= tv1->tv_usec + 1000)
+	    return -1;
+	else
+	    return 0;
+    }
+    else if ((tv1->tv_sec > tv2->tv_sec + 1) ||
+	     ((tv1->tv_sec == tv2->tv_sec + 1) && (tv1->tv_usec + 1000000 >= tv2->tv_usec + 1000)))
 	return 1;
     else if ((tv2->tv_sec > tv1->tv_sec + 1) ||
 	     ((tv2->tv_sec == tv1->tv_sec + 1) && (tv2->tv_usec + 1000000 >= tv1->tv_usec + 1000)))
