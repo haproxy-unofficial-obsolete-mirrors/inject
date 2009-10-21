@@ -287,8 +287,8 @@ int EventWrite(int fd);
 #define sizeof_buffer (BUFSIZE)
 #define sizeof_page (sizeof(struct page))
 #define sizeof_client (sizeof(struct client))
-#define sizeof_str (512)
-#define sizeof_vars (512)
+#define sizeof_str (2048)
+#define sizeof_vars (2048)
 
 #define MEM_OPTIM
 #ifdef MEM_OPTIM
@@ -503,6 +503,7 @@ static inline struct pageobj *newobj(char methode, char *host, struct sockaddr_i
     obj->uri = uri;
     obj->host = host;
     if (vars) {
+	    //fprintf(stderr, "%s, %d\n", vars, strlen(vars));
 	obj->vars = (char *)alloc_pool(vars);
 	strcpy(obj->vars, vars);
     }
@@ -1540,7 +1541,7 @@ int EventWrite(int fd) {
 
 /*** retourne 0 si OK, 1 si on doit fermer le FD ***/
 int EventRead(int fd) {
-    int ret, moretoread;
+    int ret, moretoread, maxloops = 4;
     struct pageobj *obj;
 
     obj = fdtab[fd];
@@ -1769,7 +1770,7 @@ int EventRead(int fd) {
 	    //	    printf("erreur = %d\n",errno);
 	    return 1;
 	}
-    } while (moretoread);
+    } while (moretoread && maxloops--);
     /* sinon c'est un EAGAIN, pas grave */
     return 0;
 }
