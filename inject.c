@@ -1,5 +1,5 @@
 /*
- * inject11
+ * inject12
  *
  * 2000/11/18 : correction du SEGV.
  * 2000/11/21 : grand nettoyage de l'automate et correction de nombreux bugs.
@@ -17,6 +17,8 @@
  *              Le démarrage en douceur fonctionne bien, même pour des petits délais.
  *              Le temps cumulé affiché est désormais "-1" tant que l'injection n'a pas
  *              pu démarrer.
+ * 2001/08/10 : correction de l'arret premature et ajout de la ligne de commande dans les logs.
+ *
  * Remarque : le champ "variables" HTTP peut contenir 2 "%s" qui seront remplacés par l'id du client
  *            et son mot de passe (=id)
  *
@@ -736,10 +738,14 @@ int stats(void *arg) {
 					    "  last  errs  tout htime ptime nbcli\n");
 		}
 		if (totaltime > 0)
-		    deltatime = totaltime % arg_stattime; /* correct imprecision */
+		    deltatime = arg_stattime - totaltime % arg_stattime; /* correct imprecision */
 		else
-		    deltatime = 0;
-		tv_delayfrom(&nextevt, &now, arg_stattime - deltatime);
+		    deltatime = arg_stattime;
+
+		if (deltatime < arg_stattime/2) /* avoid too short time */
+		    deltatime += arg_stattime;
+
+		tv_delayfrom(&nextevt, &now, deltatime);
 		lasthits=totalhits;
 		lastread=totalread;
 		lastevt=now;
@@ -758,7 +764,7 @@ int stats(void *arg) {
 */
 static inline int injecteur(void *arg) {
     static struct timeval next;
-    unsigned long delay;
+    int delay = -1;
 
     if ((arg_maxiter > 0) && (iterations >= arg_maxiter)) /* c'est la fin, on ne veut plus injecter */
 	return -1;
@@ -1451,6 +1457,8 @@ int main(int argc, char **argv) {
     long int deltatime;
     time_t launch_time;
     struct tm *tm;
+    int orig_argc = argc;
+    char **orig_argv = argv;
     char *mois[12]={"Jan","Fev","Mar","Avr","Mai","Juin",
                     "Juil","Aou","Sep","Oct","Nov","Dec"};
 
@@ -1556,6 +1564,11 @@ int main(int argc, char **argv) {
 	   (long)launch_time,
            tm->tm_mday, mois[tm->tm_mon], tm->tm_year+1900,
            tm->tm_hour, tm->tm_min, tm->tm_sec);
+    printf("Ligne de commande : ");
+    while (orig_argc--) {
+	printf("%s ", *orig_argv++);
+    }
+    putchar('\n');
     return 0;
 }
 
@@ -1564,6 +1577,7 @@ int main(int argc, char **argv) {
  * Trace du probleme du connect().
  * Injecteur <inject6> sur un kernel 2.4.0test11, serveur <sizesrv> sur un 2.2.18-22wt4.
  * --> Voir la socket 4 : elle ne se débloque jamais.
+ * rem: un problème similaire a été observé sur sizesrv dans la gestion des signaux.
  *
  * socket(PF_INET, SOCK_STREAM, IPPROTO_TCP) = 4
  * fcntl(4, F_SETFL, O_RDONLY|O_NONBLOCK)  = 0
@@ -1582,6 +1596,4 @@ int main(int argc, char **argv) {
  * gettimeofday({974847719, 577047}, NULL) = 0
  * select(5, NULL, [4], NULL, {0, 0})      = 0 (Timeout)
  * gettimeofday({974847719, 577262}, NULL) = 0
-
-
  */
