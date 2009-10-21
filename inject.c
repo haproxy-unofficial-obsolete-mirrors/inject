@@ -967,6 +967,7 @@ int show_stats(void *arg) {
 			    (long)((stats[0].totalread-lastread)/(unsigned long long)deltatime),
 			    stats[0].totalerr, stats[0].totaltout,
 			    stats[0].moy_htime, stats[0].moy_sdhtime, stats[0].moy_ptime, stats[0].nbcli, stats[0].nbconn);
+		   fflush(stdout);
 		} else {
 		    fprintf(stderr,"%7ld %5ld  %5ld %5ld %9lld %5ld %5ld %5ld %5ld %03.1f %3.1f %03.1f\n",
 			    stats[0].totalhits, stats[0].stat_hits,
@@ -977,6 +978,7 @@ int show_stats(void *arg) {
 			    (long)((stats[0].totalread-lastread)/(unsigned long long)deltatime),
 			    stats[0].totalerr, stats[0].totaltout,
 			    stats[0].moy_htime, stats[0].moy_sdhtime, stats[0].moy_ptime);
+		   fflush(stdout);
 		}
 	    }
 	    
