@@ -94,6 +94,13 @@
 #define BUFSIZE		4096
 #define TRASHSIZE	65536
 
+/* this reduces the number of calls to select() by choosing appropriate
+ * sheduler precision in milliseconds. It should be near the minimum
+ * time that is needed by select() to collect all events. All timeouts
+ * are rounded up by adding this value prior to pass it to select().
+ */
+#define SCHEDULER_RESOLUTION	9
+
 /* show stats this every millisecond, 0 to disable */
 #define STATTIME	1000
 
@@ -918,15 +925,19 @@ void SelectRun() {
 	  next_time = MINTIME(time2, next_time);
       }
 
-      if (next_time >= 0) {
+      if (next_time > 0) {
 	  /* Convert to timeval */
-	  next_time += 1; /* to avoid fast loops due to timeouts */
-	  delta.tv_sec=next_time/1000; 
-	  delta.tv_usec=(next_time%1000)*1000;
+	  /* to avoid eventual select loops due to timer precision */
+	  next_time += SCHEDULER_RESOLUTION;
+	  delta.tv_sec  = next_time / 1000; 
+	  delta.tv_usec = (next_time % 1000) * 1000;
+      }
+      else if (next_time == 0) { /* allow select to return immediately when needed */
+	  delta.tv_sec = delta.tv_usec = 0;
       }
 
 
-    /* on restitue l'etat des fdset */
+      /* on restitue l'etat des fdset */
 
 #define FDSET_OPTIM
 #ifndef FDSET_OPTIM
@@ -1243,7 +1254,7 @@ int EventRead(int fd) {
 
 	    moretoread = 1;
 	}
-	else if (ret == 0) {
+	else if ((ret == 0) || (ret == -1 && errno == ECONNRESET)) {
 	    char *ptr1, *ptr2, *cookie, *ptr3;
 	    char *header;
 
