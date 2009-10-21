@@ -93,6 +93,9 @@
 #define OBJ_STNEW	-1
 #define OBJ_STTERM	-2
 
+// no read should be smaller than the smallest TCP MSS
+#define MIN_READ_SIZE	0
+
 #define BUFSIZE		4096
 #define TRASHSIZE	65536
 
@@ -746,7 +749,7 @@ int stats(void *arg) {
 				(long)((totalread-lastread)/(unsigned long long)deltatime),
 				totalerr, totaltout,
 				moy_htime, moy_ptime, nbactcli);
-			fflush(stdout);
+                        fflush(stdout);
 		    }
 		    else
 			fprintf(stderr,"%7ld %5ld  %5ld %5ld %9lld %5ld %5ld %5ld %5ld %03.1f %03.1f\n",
@@ -917,7 +920,7 @@ void SelectRun() {
   int next_time, time2;
   int status;
   int fd,i;
-  struct timeval delta;
+  struct timeval delta, delta_cp;
   int readnotnull, writenotnull;
 
   while (!stopnow) {
@@ -965,13 +968,30 @@ void SelectRun() {
 #endif
       /* On va appeler le select(). Si le temps fixé est nul, on considère que
 	 c'est un temps infini donc on passe NULL à select() au lieu de {0,0}.  */
+      delta_cp = delta;
       status=select(maxfd,
 		    readnotnull ? ReadEvent : NULL,
 		    writenotnull ? WriteEvent : NULL,
 		    NULL,
 		    (next_time >= 0) ? &delta : NULL);
       
-      tv_now(&now);
+#ifdef USE_SELECT_REMAINING_TIME
+      if (next_time >= 0) {
+         /* this is possible on linux only */
+         now.tv_sec  += delta_cp.tv_sec - delta.tv_sec;
+         now.tv_usec += delta_cp.tv_usec - delta.tv_usec;
+         while ((signed long)now.tv_usec < 0) {
+            now.tv_usec += 1000000;
+            now.tv_sec --;
+         }
+         while ((signed long)now.tv_usec >= 1000000) {
+            now.tv_usec -= 1000000;
+            now.tv_sec ++;
+         }
+      } else
+#endif
+         tv_now(&now);
+
       if (status > 0) { /* Appeller les events */
 
 	  int fds;
@@ -1252,19 +1272,26 @@ int EventRead(int fd) {
 	}
 
 	if (obj->buf + BUFSIZE <= obj->read) { /* on ne stocke pas les data dépassant le buffer */
+            int readsz = sizeof(trash);
 #ifndef MSG_NOSIGNAL
-	    ret=recv(fd, trash, sizeof(trash),0);  /* lire les data mais ne pas les stocker */
+	    ret=recv(fd, trash, readsz,0);  /* lire les data mais ne pas les stocker */
 #else
-	    ret=recv(fd, trash, sizeof(trash),MSG_NOSIGNAL);  /* lire les data mais ne pas les stocker */
+	    ret=recv(fd, trash, readsz,MSG_NOSIGNAL/*|MSG_WAITALL*/);  /* lire les data mais ne pas les stocker */
 #endif
+	    if (ret == readsz || ret >= MIN_READ_SIZE)
+	       moretoread=1;
 	} else {
+            int readsz = BUFSIZE - (obj->read - obj->buf);
 #ifndef MSG_NOSIGNAL
-	    ret=recv(fd, obj->read, BUFSIZE - (obj->read - obj->buf), 0); /* lire et stocker les data */
+	    ret=recv(fd, obj->read, readsz, 0); /* lire et stocker les data */
 #else
-	    ret=recv(fd, obj->read, BUFSIZE - (obj->read - obj->buf), MSG_NOSIGNAL); /* lire et stocker les data */
+	    ret=recv(fd, obj->read, readsz, MSG_NOSIGNAL/*|MSG_WAITALL*/); /* lire et stocker les data */
 #endif
-	    if (ret > 0)
+	    if (ret > 0) {
 		obj->read += ret;
+	        if (ret == readsz || ret >= MIN_READ_SIZE)
+	            moretoread=1;
+            }
 	}
 
 	if (ret > 0) {
@@ -1275,11 +1302,13 @@ int EventRead(int fd) {
 	    obj->page->client->dataread+=ret;
 	    totalread += ret;
 
-	    moretoread = 1;
+	    if (!moretoread)
+		goto mustclose;
 	}
 	else if ((ret == 0) || (ret == -1 && errno == ECONNRESET)) {
 	    char *ptr1, *ptr2, *cookie, *ptr3;
 	    char *header;
+mustclose:
 
 	    /* on relève les mesures le plus tôt possible */
 	    stat_htime += tv_delta(&obj->starttime, &now);
