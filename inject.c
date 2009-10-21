@@ -223,6 +223,7 @@ int active_thread = 0;
 static struct timeval now={0,0};
 static int one = 1;
 int nbconn=0;
+int nbactconn=0;
 int clientid=0;
 int nbactcli=0;
 int shmid=0;
@@ -614,9 +615,8 @@ static inline void put_free_port(struct local_ip *ip, u_int16_t p, int offset) {
     while ((obj = page->objecttostart) != NULL) {
 	int fd;
 	obj->local_port = 0;
-	if (nbconn+arg_maxobj >= arg_maxsock ||
-	    page->actobj >= arg_maxobj) { /* on ne peut pas démarrer le fetch tout de suite */
-
+	if (nbconn+arg_maxobj >= arg_maxsock || page->actobj >= arg_maxobj) {
+	    /* on ne peut pas démarrer le fetch tout de suite */
 	    /* ce n'est pas de la faute du serveur en face, donc on reporte le timeout */
 	    if (arg_timeout > 0)
 		tv_delayfrom(&page->client->expire, &now, arg_timeout);
@@ -727,7 +727,7 @@ int newclient(char *username, char *password) {
 
 //    newclient=(struct client*)calloc(1, sizeof(struct client));
     newclient=(struct client*)alloc_pool(client);
-	memset(newclient, 0, sizeof_client);
+    memset(newclient, 0, sizeof_client);
 //fprintf(stderr,"client calloc %p\n", newclient);
 
     if (username != NULL)
@@ -773,6 +773,9 @@ void destroypage(struct page *page) {
 	    close(fd);
 	    nbconn--;
 	    stats[thr].aborted++;
+	    if (!FD_ISSET(fd, StaticWriteEvent) && FD_ISSET(fd, StaticReadEvent))
+		/* the connect() succeeded */
+		nbactconn--;
 	    fdtab[fd] = NULL;
 	    FD_CLR(fd, StaticReadEvent);
 	    FD_CLR(fd, StaticWriteEvent);
@@ -853,7 +856,9 @@ int show_stats(void *arg) {
 	if ((nextevt.tv_sec | nextevt.tv_usec) == 0)
 	    tv_now(&nextevt);
 
-	if (tv_cmp(&now, &nextevt) >= 0) {
+	if (tv_cmp(&now, &nextevt) < 0)
+	    return tv_remain(&now, &nextevt);
+	else {
 	    unsigned long long int totalread=0;
 	    unsigned long int totalhits=0;
 	    unsigned long int aborted=0;
@@ -880,8 +885,8 @@ int show_stats(void *arg) {
 		stat_ptime += stats[t].stat_ptime;    stats[t].stat_ptime = 0;
 		stat_hits  += stats[t].stat_hits;     stats[t].stat_hits = 0;
 		stat_pages += stats[t].stat_pages;    stats[t].stat_pages = 0;
-		nbconn     += stats[t].nbconn;        stats[t].nbconn  = 0;
 		nbcli      += stats[t].nbcli;         stats[t].nbcli  = 0;
+		nbconn     += stats[t].nbconn;        stats[t].nbconn = 0;
 		/* try to avoid inter-thread race without any lock */
 		tr2 = stats[t].totalread;
 		if ((tr2 & 0xffffffff) < (tr1 & 0xffffffff)) {
@@ -919,12 +924,14 @@ int show_stats(void *arg) {
 	     * standard deviation = sqrt(sum(x-moy)^2/n) = sqrt((sum(x^2)-2*moy*sum(x))/n + moy^2)
 	     */
 	    if (stats[0].stat_hits) {
+		double nb1;
 		stats[0].moy_htime = stats[0].tot_htime / (double)stats[0].stat_hits;
-		stats[0].moy_sdhtime =
-		    sqrt(
-			 (stats[0].tot_sqhtime
-			  - 2*stats[0].moy_htime*stats[0].tot_htime) / (double)stats[0].stat_hits
-			 + stats[0].moy_htime * stats[0].moy_htime);
+
+		nb1 = (stats[0].tot_sqhtime - 2*stats[0].moy_htime*stats[0].tot_htime) /
+		    (double)stats[0].stat_hits + stats[0].moy_htime * stats[0].moy_htime;
+		if (nb1 < 0.0) /* it can happen sometimes, so let's not return nans */
+		    nb1 = 0;
+		stats[0].moy_sdhtime = sqrt(nb1);
 	    }
 	    else
 		stats[0].moy_sdhtime = stats[0].moy_htime = stats[0].moy_ptime = 0;
@@ -1008,7 +1015,6 @@ static inline int injecteur(void *arg) {
 	return -1;
 
     if (nbclients < arg_nbclients) {
-
 	if ((next.tv_sec | next.tv_usec) == 0)
 	    SETNOW(&next);
 
@@ -1150,8 +1156,8 @@ void SelectRun() {
 	  time2 = scheduler(NULL);
 	  next_time = MINTIME(time2, next_time);
 
-	  if (nbconn > stats[thr].nbconn)
-	      stats[thr].nbconn = nbconn;
+	  if (nbactconn > stats[thr].nbconn)
+	      stats[thr].nbconn = nbactconn;
 	  if (nbactcli > stats[thr].nbcli)
 	      stats[thr].nbcli = nbactcli;
       }
@@ -1225,6 +1231,9 @@ void SelectRun() {
 		      nbconn--;
 		      fdtab[fd]->page->objleft--;
 		      fdtab[fd]->page->actobj--;
+		      if (!FD_ISSET(fd, StaticWriteEvent) && FD_ISSET(fd, StaticReadEvent))
+			  /* the connect() succeeded */
+			  nbactconn--;
 		      FD_CLR(fd, StaticReadEvent);
 		      FD_CLR(fd, StaticWriteEvent);
 		      fdtab[fd]->fd = OBJ_STTERM;
@@ -1497,6 +1506,7 @@ int EventWrite(int fd) {
 	FD_SET(fd, StaticReadEvent);
 	FD_CLR(fd, StaticWriteEvent);
 	//	    shutdown(fd, SHUT_WR);
+	nbactconn++; /* we are connected, let's account it */
 	return 0;
     }
     else {
@@ -1563,7 +1573,7 @@ int EventRead(int fd) {
 	    /* on relève les mesures le plus tôt possible */
 	    delta = tv_delta(&obj->starttime, &now);
 	    stats[thr].tot_htime += delta;
-	    stats[thr].tot_sqhtime += delta*delta;
+	    stats[thr].tot_sqhtime += (double)delta*(double)delta;
 	    stats[thr].stat_hits ++;
 
 #ifndef DONT_ANALYSE_HTTP_HEADERS
