@@ -11,7 +11,6 @@
 #include <rpc/types.h>
 #include <rpc/xdr.h>
 #include <libtools.h>
-#include <libSelect.h>
 #include <libNetTools.h>
 #include <fcntl.h>
 #include <errno.h>
@@ -28,8 +27,14 @@
 
 #define BUFSIZE		1024
 #define MAXSOCK		1000
+#define MAXNBFD		(3+MAXSOCK)
 
-#define Log(a, b...)	;
+#define EV_READ 1
+#define EV_WRITE 2
+#define EV_EXCEPT 4
+
+/* sur combien de bits code-t-on la taille d'un entier (ex: 32bits -> 5) */
+#define	INTBITS		5
 
 struct pageobj {
     struct sockaddr_in addr;
@@ -68,6 +73,7 @@ struct client {
 };
 
 struct scnobj {
+    struct sockaddr_in addr;
     char meth;
     char *host;
     char *uri;
@@ -97,8 +103,148 @@ int nbactcli=0;
 long int totalread=0;
 char trash[16384];
 char *scnfile = NULL;
-static struct timeval starttime;
+static struct timeval starttime = {0,0};
 static int needschedule = 0;
+int maxfd = 0;
+int stopnow = 0;
+
+static struct pageobj *fdtab[MAXNBFD];
+
+fd_set ReadEvent[(MAXNBFD + FD_SETSIZE - 1) / FD_SETSIZE],
+    WriteEvent[(MAXNBFD + FD_SETSIZE - 1) / FD_SETSIZE];
+
+fd_set StaticReadEvent[(MAXNBFD + FD_SETSIZE - 1) / FD_SETSIZE],
+    StaticWriteEvent[(MAXNBFD + FD_SETSIZE - 1) / FD_SETSIZE];
+
+
+/***************** libselect ***********************/
+
+
+static int __reschedule;
+
+
+int SelectRun() {
+  int next_time, time2;
+  int status;
+  int fd;
+  struct timeval delta;
+
+  Log(LOG_LFUNC,"[Select] Run\n");
+
+  next_time=1; /* delai mini on est pas venu ici pour dormir  */
+
+  while(!stopnow) {
+    do {
+	__reschedule=0;
+	next_time = injecteur();
+	time2 = scheduler();
+
+	if ((next_time == 0) || (next_time > time2))
+	    next_time = time2;
+
+    } while(__reschedule==1);
+    
+    /* Conversion en timeval */
+    delta.tv_sec=next_time/1000; 
+    delta.tv_usec=(next_time%1000)*1000;
+
+    /* on restitue l'etat des fdset */
+    memcpy(ReadEvent, StaticReadEvent, sizeof(ReadEvent));
+    memcpy(WriteEvent, StaticWriteEvent, sizeof(WriteEvent));
+
+#if 0
+    for (fd=0; fd<maxfd; fd++) {
+	printf("fd %d :",fd);
+	if (FD_ISSET(fd, ReadEvent))
+	    printf(" read");
+	else
+	    printf(" -");
+	if (FD_ISSET(fd, WriteEvent))
+	    printf(" write");
+	else
+	    printf(" -");
+	printf("\n");
+    }
+#endif
+
+    if (maxfd) {
+	/* On va appeler le select(). Si le temps fixé est nul, on considère que
+	   c'est un temps infini donc on passe NULL à select() au lieu de {0,0}.  */
+	status=select(maxfd, ReadEvent, WriteEvent, NULL, ((delta.tv_usec == 0) && (delta.tv_sec == 0)) ? NULL : &delta);
+
+	if (status > 0) { /* Appeller les events */
+
+	    int fds;
+	    char count;
+	    char closeit = 0;
+
+	    /* test sur les FD en lecture. On les parcourt 32 par 32 pour gagner du temps */
+	    for (fds = 0; (fds << INTBITS) < maxfd; fds++)
+		if ((((int *)(ReadEvent))[fds] | ((int *)(WriteEvent))[fds]) != 0)  /* au moins un FD non nul */
+		    for (count = 1<<INTBITS, fd = fds << INTBITS; count && fd < maxfd; count--, fd++) {
+
+			closeit = 0;
+		    
+			if (!closeit && FD_ISSET(fd, WriteEvent))
+			    closeit |= EventWrite(fd);
+
+			if (!closeit && FD_ISSET(fd, ReadEvent))
+			    closeit |= EventRead(fd);
+			if (closeit) {
+			    close(fd);
+			    nbconn--;
+			    fdtab[fd]->page->objleft--;
+			    FD_CLR(fd, StaticReadEvent);
+			    FD_CLR(fd, StaticWriteEvent);
+			
+			    fdtab[fd]=NULL;
+			
+			    if (maxfd == fd+1) {   /* recompute maxfd */
+				while ((fd >= 0) && (fdtab[fd] == NULL))
+				    fd--;
+				maxfd = fd+1;
+			    }
+			}
+		    }
+	}
+    }
+  }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 /* crée un objet pour une page :
    methode = { METH_GET | METH_POST } 
@@ -108,15 +254,15 @@ static int needschedule = 0;
    page    = page web de rattachement
    Toutes les chaines sont réallouées dynamiquement (strdup).
 */   
-struct pageobj *newobj(char methode, char *addr, char *uri, char *vars, struct page *page) {
+struct pageobj *newobj(char methode, char *host, struct sockaddr_in *addr, char *uri, char *vars, struct page *page) {
     struct pageobj *obj;
 
     obj=(struct pageobj *)calloc(1, sizeof(struct pageobj));
-    memcpy(&obj->addr, str2sa(addr), sizeof(obj->addr));
+    memcpy(&obj->addr, addr, sizeof(obj->addr));
     obj->fd	= -1;  /* fd non ouvert */
     obj->meth	= methode;
     obj->uri	= strdup(uri);
-    obj->host	= strdup(addr);
+    obj->host	= strdup(host);
     if (vars != NULL)
 	obj->vars	= strdup(vars);
     obj->next	= NULL;
@@ -147,10 +293,10 @@ struct page *newpage(struct scnpage *scn, struct client *client) {
 	if ((scnobj->vars != NULL) && (client != NULL) &&
 	    (client->username != NULL) && (client->password != NULL)) {
 	    sprintf(variables, scnobj->vars, client->username, client->password);
-	    *obj = newobj(scnobj->meth, scnobj->host, scnobj->uri, variables, page);
+	    *obj = newobj(scnobj->meth, scnobj->host, &scnobj->addr, scnobj->uri, variables, page);
 	}
 	else 
-	    *obj = newobj(scnobj->meth, scnobj->host, scnobj->uri, NULL, page);
+	    *obj = newobj(scnobj->meth, scnobj->host, &scnobj->addr, scnobj->uri, NULL, page);
 
 	obj=&((*obj)->next);
     }
@@ -252,6 +398,7 @@ struct scnobj *newscnobj(int meth, char *host, char *uri, char *vars) {
 	Abort("Scenario must define PAGE before OBJECT.\n");
 
     obj = (struct scnobj *)calloc(1, sizeof(struct scnobj));
+    memcpy(&obj->addr, str2sa(host), sizeof(obj->addr));
 
     obj->meth = meth;
     obj->host = strdup(host);
@@ -348,82 +495,92 @@ int parsescnline(char *line) {
 }
 
 
-/****************************************/
-
-void Event(int fd, int flags, struct pageobj *obj) {
+/*** retourne 0 si OK, 1 si on doit fermer le FD ***/
+int EventWrite(int fd) {
     int ret;
     char req[2048];
     char *r = req;
+    struct pageobj *obj;
+    int data, ldata;
 
-    Log(LOG_LFUNC,"[Event].\n");
 
     /* small optimization for the scheduler */
     needschedule = 1;
+    obj = fdtab[fd];
 
-    if (flags & EV_WRITE) {
-	int data, ldata;
+    Log(LOG_LFUNC,"[EventWrite]. fd=%d, obj=%p\n", fd, obj);
 
-	ldata=sizeof(data);
-	getsockopt(fd, SOL_SOCKET, SO_ERROR, &data, &ldata);
+    ldata=sizeof(data);
+    getsockopt(fd, SOL_SOCKET, SO_ERROR, &data, &ldata);
 
-	if (data > 0) {  /* erreur sur la socket */
-	    Log(LOG_LERR,"[Event] erreur sur le connect() : %d\n",data);
-	    DeregisterEvent(fd);
-	    close(fd);
-	    nbconn--;
-	    obj->page->objleft--;
+    if (data > 0) {  /* erreur sur la socket */
+	Log(LOG_LERR,"[Event] erreur sur le connect() : %d\n",data);
+	tv_now(&obj->page->end);
+	obj->page->client->status = obj->page->status = STATUS_ERROR;
+	__reschedule=1;
+	return 1;
+    }
+
+    /* pas d'erreur */
+    Log(LOG_LPERF,"[Event] client <%s> : connection établie.\n", obj->page->client->username);
+    /* créer la requête */
+    if (obj->meth == METH_POST) {	    
+	r+=sprintf(r, "POST %s HTTP/1.0\r\n", obj->uri);
+	if (obj->page->client->cookie)
+	    r+=sprintf(r, "Cookie: %s\r\n", obj->page->client->cookie);
+	if (obj->vars) {		
+	    r+=sprintf(r,"Content-length: %d\r\n",strlen(obj->vars));
+	    r+=sprintf(r,"\r\n");
+	    r+=sprintf(r, "%s", obj->vars);
+	}
+	else
+	    r+=sprintf(r,"\r\n");
+    }
+    else /* meth = METH_GET */ {
+	r+=sprintf(r, "GET %s", obj->uri);
+	if (obj->vars)
+	    r+=sprintf(r,"?%s", obj->vars);
+	r+=sprintf(r," HTTP/1.0\r\n");
+	if (obj->page->client->cookie)
+	    r+=sprintf(r, "Cookie: %s\r\n", obj->page->client->cookie);
+	r+=sprintf(r, "Host: %s\r\n", obj->host);
+	r+=sprintf(r,"\r\n");
+    }
+    /* la requete est maintenant prete */
+    if (write(fd, req, strlen(req)) == -1) {
+	if (errno != EAGAIN) {
+	    Log(LOG_LERR,"[Event] erreur sur le write().\n");
 	    tv_now(&obj->page->end);
 	    obj->page->client->status = obj->page->status = STATUS_ERROR;
-	    Reschedule();
-	    return;
-	}
-
-	/* pas d'erreur */
-	Log(LOG_LPERF,"[Event] client <%s> : connection établie.\n", obj->page->client->username);
-	/* créer la requête */
-	if (obj->meth == METH_POST) {	    
-	    r+=sprintf(r, "POST %s HTTP/1.0\r\n", obj->uri);
-	    if (obj->page->client->cookie)
-		r+=sprintf(r, "Cookie: %s\r\n", obj->page->client->cookie);
-	    if (obj->vars) {		
-		r+=sprintf(r,"Content-length: %d\r\n",strlen(obj->vars));
-		r+=sprintf(r,"\r\n");
-		r+=sprintf(r, "%s", obj->vars);
-	    }
-	    else
-		r+=sprintf(r,"\r\n");
-	}
-	else /* meth = METH_GET */ {
-	    r+=sprintf(r, "GET %s", obj->uri);
-	    if (obj->vars)
-		r+=sprintf(r,"?%s", obj->vars);
-	    r+=sprintf(r," HTTP/1.0\r\n");
-	    if (obj->page->client->cookie)
-		r+=sprintf(r, "Cookie: %s\r\n", obj->page->client->cookie);
-	    r+=sprintf(r, "Host: %s\r\n", obj->host);
-	    r+=sprintf(r,"\r\n");
-	}
-	/* la requete est maintenant prete */
-	if (write(fd, req, strlen(req)) == -1) {
-	    if (errno != EAGAIN) {
-		Log(LOG_LERR,"[Event] erreur sur le write().\n");
-		DeregisterEvent(fd);
-		close(fd);
-		nbconn--;
-		obj->page->objleft--;
-		tv_now(&obj->page->end);
-		obj->page->client->status = obj->page->status = STATUS_ERROR;
-		Reschedule();
-		return;
-	    }
-	}
-	else {
-	    SetEvent(fd, EV_READ);
-	    Log(LOG_LDEBUG,"[Event] envoi de la requete <%s>\n",req);
-	    //	    obj->page->client->status = obj->page->status = STATUS_START;
+	    __reschedule=1;
+	    return 1;
 	}
     }
-    else if (flags & EV_READ) {
+    else {
+	FD_SET(fd, StaticReadEvent);
+	FD_CLR(fd, StaticWriteEvent);
+	Log(LOG_LDEBUG,"[Event] envoi de la requete <%s>\n",req);
+	//	    obj->page->client->status = obj->page->status = STATUS_START;
+    }
+    return 0;
+}
+
+
+/*** retourne 0 si OK, 1 si on doit fermer le FD ***/
+int EventRead(int fd) {
+    int ret, moretoread;
+    char req[2048];
+    char *r = req;
+    struct pageobj *obj;
+
+    /* small optimization for the scheduler */
+    needschedule = 1;
+    obj = fdtab[fd];
+
+    Log(LOG_LFUNC,"[EventRead] : fd=%d, obj=%p.\n", fd, obj);
+
+    do {
+	moretoread = 0;
 	if (obj->buf + BUFSIZE == obj->read)  /* on ne stocke pas les data dépassant le buffer */
 	    ret=read(fd, trash, sizeof(trash));  /* lire les data mais ne pas les stocker */
 	else {
@@ -431,23 +588,22 @@ void Event(int fd, int flags, struct pageobj *obj) {
 	    if (ret > 0)
 		obj->read+=ret;
 	}
+
 	Log(LOG_LDEBUG,"[Event] socket <%d> du client <%s> : read() = %d.\n",
 	    fd, obj->page->client->username, ret);
-	if (ret>0) {
 
+	if (ret>0) {
 	    if ((starttime.tv_sec | starttime.tv_usec) == 0)  /* la premiere fois, on démarre le chrono */
 		tv_now(&starttime);
 
 	    obj->page->dataread+=ret;
 	    obj->page->client->dataread+=ret;
+
+	    moretoread = 1;
 	}
 	else if (ret == 0) {
 	    char *ptr1, *ptr2, *cookie, *ptr3;
 	    char *header;
-	    DeregisterEvent(fd);
-	    close(fd);
-	    nbconn--;
-
 	    /* lire les headers pour savoir s'il y a un cookie */
 	    ptr1=obj->buf;
 	    while (ptr1<obj->read) {
@@ -511,32 +667,31 @@ void Event(int fd, int flags, struct pageobj *obj) {
 	    }
 
 
-	    if (--obj->page->objleft == 0) {  /* dernier objet de cette page */
+	    if (obj->page->objleft == 1) {  /* dernier objet de cette page */
 		Log(LOG_LDEBUG,"[Event] dernier objet de la page, mise en veille du client.\n");
 		tv_now(&obj->page->end);
 		tv_wait(&obj->page->client->nextevent, obj->page->thinktime);
 		if (obj->page->client->status != STATUS_ERROR) {
 		    obj->page->client->status = obj->page->status = STATUS_THINK;
-		    Reschedule();
+		    __reschedule=1;
 		}
 	    }
 	    else 
 		Log(LOG_LDEBUG,"[Event] encore <%d> objets sur la page <%p>.\n",
-		    obj->page->objleft, obj->page);
+		    obj->page->objleft-1, obj->page);
 
+	    /* liberer le fd en sortant */
+	    return 1;
 	}
 	else if ((ret == -1) && (errno != EAGAIN)) {
 	    Log(LOG_LDEBUG,"[Event] erreur, arrêt du client <%p>.\n", obj->page->client);
-	    DeregisterEvent(fd);
-	    close(fd);
-	    nbconn--;
-
-	    obj->page->objleft--;
 	    obj->page->client->status = STATUS_ERROR;
-	    Reschedule();
+	    __reschedule=1;
+	    return 1;
 	}
-	/* sinon c'est un EAGAIN, pas grave */
-    }
+    } while (moretoread);
+    /* sinon c'est un EAGAIN, pas grave */
+    return 0;
 }
 
 /* ce scheduler s'occupe d'injecter des clients tant qu'il n'y en a pas assez, mais jamais
@@ -566,8 +721,10 @@ int injecteur(void *arg) {
 	else
 	    delay=tv_delta(&next, &now);
     }
-    else
+    else {
+	Log(LOG_LWARN, "Plus de socket, patienter 1 seconde.\n");
 	delay = 1000;  /* 1 seconde si plus de sockets */
+    }
 
     return delay;
 }
@@ -625,7 +782,7 @@ int scheduler(void *arg) {
 		int del2;
 		del2 = tv_remain(&now, &cli->nextevent);
 		if (del2 < delay)
-		    delay=del2;
+		    delay = del2;
 	    }
 	}
 
@@ -636,7 +793,7 @@ int scheduler(void *arg) {
 	    destroyclient(cli);
 	    cli=newcli;
 	    nbactcli--;
-	    Reschedule();  /* on peut avoir à relancer des clients */
+	    __reschedule=1;  /* on peut avoir à relancer des clients */
 	    goto nextclient;
 	}
 
@@ -656,7 +813,7 @@ int scheduler(void *arg) {
 		        destroyclient(cli);
 		        cli=newcli;
 		        nbactcli--;
-		        Reschedule();  /* on peut avoir à relancer des clients */
+		        __reschedule=1;  /* on peut avoir à relancer des clients */
 		        goto nextclient;
 		    }
 		    if (fcntl(obj->fd, F_SETFL, O_NONBLOCK)==-1) {
@@ -668,14 +825,19 @@ int scheduler(void *arg) {
 		        destroyclient(cli);
 		        cli=newcli;
 		        nbactcli--;
-		        Reschedule();  /* on peut avoir à relancer des clients */
+		        __reschedule=1;  /* on peut avoir à relancer des clients */
 		        goto nextclient;
 		    }
 		    else {
 			nbconn++;
 			Log(LOG_LPERF,"Nouvelle connexion : %d. %d connections actives pour %d clients.\n", obj->fd,
 			    nbconn, nbactcli);
-			RegisterEvent(obj->fd, EV_WRITE, &Event, obj);
+
+			fdtab[obj->fd]=obj;
+			FD_SET(obj->fd, StaticWriteEvent);
+
+			if (obj->fd+1 > maxfd)
+			    maxfd = obj->fd+1;
 		    }
 		    obj=obj->next;
 		    page->objleft++;
@@ -715,15 +877,10 @@ int readscnfile(char *file) {
     return 0;
 }
 
-
-void stopper(int sig) {
-    static struct timeval now;
-    tv_now(&now);
-    printf("Arret: %ld clients ont chargé %ld octets en %ld ms : %ld kB/s.\n",
-	   iterations, totalread, tv_delta(&now, &starttime), totalread/(tv_delta(&now, &starttime)?:1));
-    exit(0);
+void sighandler(int sig) {
+    stopnow = 1;
+    return;
 }
-
 
 int main(int argc, char **argv) {
 
@@ -735,19 +892,25 @@ int main(int argc, char **argv) {
     nbiterations = atol(argv[2]) * nbclients;
     injectdelay = atol(argv[3]);
     scnfile = argv[4];
-    tv_now(&starttime);  /* just in case it's stopped too early */
-    signal(SIGINT, &stopper);
 
-    //    LogOpen("/tmp/injecteur.log", LOG_LERR | LOG_LPERF | LOG_LWARN | LOG_LAPP);
+    LogOpen("/tmp/injecteur.log", LOG_LERR | LOG_LWARN /*| LOG_LAPP | LOG_LPERF*/);
 
     if (readscnfile(scnfile) < 0) {
 	Log(LOG_LFATAL, "[inject] Error reading scn file : %s\n", scnfile);
 	exit(1);
     }
 
-    RegisterScheduler(&injecteur, NULL);
-    RegisterScheduler(&scheduler, NULL);
+    FD_ZERO(StaticReadEvent);
+    FD_ZERO(StaticWriteEvent);
+    bzero(fdtab, sizeof(fdtab));
+
+    signal(SIGINT, sighandler);
     SelectRun();
+
+    tv_now(&now);
+    Log(LOG_LPERF, "Fin: %ld clients ont chargé %ld octets en %ld ms : %ld kB/s.\n",
+	iterations, totalread, tv_delta(&now, &starttime), totalread/(tv_delta(&now, &starttime)?:1));
+    printf("Fin: %ld clients ont chargé %ld octets en %ld ms : %ld kB/s.\n",
+	   iterations, totalread, tv_delta(&now, &starttime), totalread/(tv_delta(&now, &starttime)?:1));
     return 0;
 }
-
