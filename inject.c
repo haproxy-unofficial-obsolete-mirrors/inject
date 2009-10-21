@@ -1,5 +1,5 @@
 /*
- * Injecteur HTTP simple (C) 2000-2005 Willy Tarreau <willy@ant-computing.com>
+ * Injecteur HTTP simple (C) 2000-2009 Willy Tarreau <willy@ant-computing.com>
  * Utilisation et redistribution soumises a la licence GPL.
  *
  * 2000/11/18 : correction du SEGV.
@@ -129,6 +129,31 @@
 #define MINTIME(old, new)	(((new)<0)?(old):(((old)<0||(new)<(old))?(new):(old)))
 #define SETNOW(a)		(*a=now)
 
+/*
+ * Gcc >= 3 provides the ability for the programme to give hints to the
+ * compiler about what branch of an if is most likely to be taken. This
+ * helps the compiler produce the most compact critical paths, which is
+ * generally better for the cache and to reduce the number of jumps.
+ */
+#if !defined(likely)
+#if __GNUC__ < 3
+#define __builtin_expect(x,y) (x)
+#define likely(x) (x)
+#define unlikely(x) (x)
+#elif __GNUC__ < 4
+/* gcc 3.x does the best job at this */
+#define likely(x) (__builtin_expect((x) != 0, 1))
+#define unlikely(x) (__builtin_expect((x) != 0, 0))
+#else
+/* GCC 4.x is stupid, it performs the comparison then compares it to 1,
+ * so we cheat in a dirty way to prevent it from doing this. This will
+ * only work with ints and booleans though.
+ */
+#define likely(x) (x)
+#define unlikely(x) (__builtin_expect((unsigned long)(x), 0))
+#endif
+#endif
+
 /* a local IP addresses list */
 struct local_ip {
     struct in_addr addr;
@@ -218,6 +243,8 @@ int arg_maxsock = 1000;
 char *arg_scnfile = NULL;
 char *arg_sourceaddr = NULL;
 int arg_random_delay = 0;
+int arg_fast_connect = 0;
+int arg_fast_close = 0;
 int arg_regular_time = 0;
 static int arg_timeout = 0;
 static int arg_log = 0, arg_abs_time = 0;
@@ -229,6 +256,7 @@ int active_thread = 0;
 
 static struct timeval now={0,0};
 static int one = 1;
+static int zero = 0;
 int nbconn=0;
 int nbactconn=0;
 int clientid=0;
@@ -619,11 +647,12 @@ static inline void put_free_port(struct local_ip *ip, u_int16_t p, int offset) {
 */
 /*static inline*/ int continue_fetch(struct page *page) {
     struct pageobj *obj;
+    int attempts = 0;
 
     while ((obj = page->objecttostart) != NULL) {
 	int fd;
 	obj->local_port = 0;
-	if (nbconn+arg_maxobj >= arg_maxsock || page->actobj >= arg_maxobj) {
+	if (unlikely(nbconn+arg_maxobj >= arg_maxsock || page->actobj >= arg_maxobj)) {
 	    /* on ne peut pas démarrer le fetch tout de suite */
 	    /* ce n'est pas de la faute du serveur en face, donc on reporte le timeout */
 	    if (arg_timeout > 0)
@@ -634,7 +663,8 @@ static inline void put_free_port(struct local_ip *ip, u_int16_t p, int offset) {
 	if ((page->begin.tv_sec | page->begin.tv_usec) == 0)
 	    SETNOW(&page->begin);
 
-	if ((fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)) == -1) {
+    retry:
+	if (unlikely((fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)) == -1)) {
 	    //	    fprintf(stderr, "impossible de créer une socket, destruction du client.\n");
 	    //	    destroyclient(page->client, NULL); /* renvoie un pointeur sur le suivant */
 	    //	    return 0; /* killed client */
@@ -649,23 +679,29 @@ static inline void put_free_port(struct local_ip *ip, u_int16_t p, int offset) {
 		local_addr.sin_port = htons(obj->local_port);
 		local_addr.sin_family = AF_INET;
 
-		/* if bind fails, let's the system do its own work */
-		if (bind(fd, (struct sockaddr *)&local_addr, sizeof local_addr) == -1) {
+		/* if bind fails, let the system do its own work */
+		if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (char *) &one, sizeof(one)) == -1 ||
+		    bind(fd, (struct sockaddr *)&local_addr, sizeof local_addr) == -1) {
 		    put_free_port(page->client->addr, obj->local_port, thr-1);
 		    obj->local_port = 0;
 		}
 	    }
 	}
 
-	if ((setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (char *) &one, sizeof(one)) == -1) ||
-	    (fcntl(fd, F_SETFL, O_NONBLOCK)==-1)) {
-	    fprintf(stderr,"impossible de mettre la socket en O_NONBLOCK\n");
-	}
-	if ((connect(fd, (struct sockaddr *)&obj->addr, sizeof(obj->addr)) == -1) && (errno != EINPROGRESS)) {
-	    if (errno == EAGAIN) { /* plus de ports en local -> réessayer plus tard */
+	fcntl(fd, F_SETFL, O_NONBLOCK);
+
+#ifdef TCP_QUICKACK
+	/* we don't want quick ACKs there */
+	if (arg_fast_connect)
+		setsockopt(fd, SOL_TCP, TCP_QUICKACK, (char *) &zero, sizeof(zero));
+#endif
+	if (unlikely((connect(fd, (struct sockaddr *)&obj->addr, sizeof(obj->addr)) == -1) && (errno != EINPROGRESS))) {
+	    if (errno == EAGAIN || errno == EADDRNOTAVAIL) { /* plus de ports en local -> réessayer plus tard */
 		put_free_port(page->client->addr, obj->local_port, thr-1);
 		obj->local_port = 0;
 		close(fd);
+		if (attempts++ < 10)
+			goto retry;
 		return 2;
 	    }
 	    else if (errno != EALREADY && errno != EISCONN) {
@@ -692,6 +728,7 @@ static inline void put_free_port(struct local_ip *ip, u_int16_t p, int offset) {
 		maxfd = fd+1;
 	}
 	page->objecttostart = obj->next;
+	attempts = 0;
     }
     return 1; /* ok */
 }
@@ -1460,6 +1497,18 @@ int parsescnline(char *line) {
     return -1; /* unknown sequence */
 }
 
+/* return pointer to the final 0.
+ * Warning: it's up to the caller to check the length.
+ */
+char *str_add(char *dst, const char *add)
+{
+	dst--;
+	do {
+		*++dst = *add++;
+	} while (*dst);
+
+	return dst;
+}
 
 /*** retourne 0 si OK, 1 si on doit fermer le FD ***/
 int EventWrite(int fd) {
@@ -1474,17 +1523,37 @@ int EventWrite(int fd) {
 	tv_delayfrom(&obj->page->client->expire, &now, arg_timeout);
 
     /* créer la requête */
-    if (obj->meth == METH_GET)  {
-	r+=sprintf(r, "GET %s", obj->uri);
-	if (obj->vars)
-	    r+=sprintf(r,"?%s", obj->vars);
-	r+=sprintf(r," HTTP/1.0\r\n"
-		   "Host: %s\r\nUser-Agent: " USER_AGENT "\r\n", obj->host);
-	if (obj->page->client->cookie)
-	    r+=sprintf(r, "Cookie: %s\r\n", obj->page->client->cookie);
+    if (likely(obj->meth == METH_GET)) {
+	r = str_add(r, "GET ");
+	r = str_add(r, obj->uri);
+	if (obj->vars) {
+		*r++ = '?';
+		r = str_add(r, obj->vars);
+	}
+
+	r = str_add(r,
+		    " HTTP/1.0\r\n"
+		    "User-Agent: " USER_AGENT "\r\n"
+		    "Connection: close\r\n"
+		    "Host: "
+		    );
+
+	r = str_add(r, obj->host);
+	*r++ = '\r';
+	*r++ = '\n';
+
+	if (obj->page->client->cookie) {
+		r = str_add(r, "Cookie: ");
+		r = str_add(r, obj->page->client->cookie);
+		*r++ = '\r';
+		*r++ = '\n';
+	}
+
 	if (global_headers)
-	    r+=sprintf(r, "%s", global_headers);
-	r+=sprintf(r, "Connection: close\r\n\r\n");
+		r = str_add(r, global_headers);
+
+	*r++ = '\r';
+	*r++ = '\n';
     }
     else { /* meth = METH_POST */
 	r+=sprintf(r,
@@ -1520,25 +1589,38 @@ int EventWrite(int fd) {
 	    data = send(fd, req, r-req, MSG_DONTWAIT);
     }
 #else
+#ifdef TCP_CORK
+    /* If we force binding to a local port, we have SO_REUSEADDR set,
+     * so we're not annoyed with local TIME_WAIT sockets. Thus, we can
+     * send a fast shutdown, so it makes sense to try to merge FIN with
+     * last ACK, hence this TCP_CORK ! But we only do this with fast
+     * close enabled, this allows us to disable the feature by default.
+     */
+    if (arg_fast_close && obj->local_port)
+	    setsockopt(fd, SOL_TCP, TCP_CORK, (char *) &one, sizeof(one));
+#endif
     data = send(fd, req, r-req, MSG_DONTWAIT | MSG_NOSIGNAL);
 #endif
-    /* la requete est maintenant prete */
-    if (data != -1) {
-	FD_SET(fd, StaticReadEvent);
-	FD_CLR(fd, StaticWriteEvent);
-	//	    shutdown(fd, SHUT_WR);
-	nbactconn++; /* we are connected, let's account it */
-	return 0;
-    }
-    else {
+
+    if (unlikely(data == -1)) {
 	if (errno != EAGAIN) {
-	    //		fprintf(stderr,"[Event] erreur sur le write().\n");
-	    //		/*tv_now*/SETNOW(&obj->page->end);
 	    obj->page->client->status = obj->page->status = STATUS_ERROR;
 	    return 1;
 	}
 	return 0;  /* erreur = EAGAIN */
     }
+
+    /* la requete est maintenant prete */
+    FD_SET(fd, StaticReadEvent);
+    FD_CLR(fd, StaticWriteEvent);
+#ifdef TCP_CORK
+    /* we can and must shutdown write if we use cork, see explanation above */
+    if (arg_fast_close && obj->local_port) {
+	    shutdown(fd, SHUT_WR);
+    }
+#endif
+    nbactconn++; /* we are connected, let's account it */
+    return 0;
 }
 
 
@@ -1873,11 +1955,11 @@ void sighandler(int sig) {
 
 void usage() {
     fprintf(stderr,
-	    "Inject29 - simple HTTP load generator (C) 2000-2005 Willy Tarreau <w@w.ods.org>\n"
+	    "Inject32 - simple HTTP load generator (C) 2000-2009 Willy Tarreau <w@1wt.eu>\n"
 	    "Syntaxe : inject -u <users> -f <scnfile> [-i <iter>] [-d <duration>] [-l] [-r]\n"
 	    "          [-t <timeout>] [-n <maxsock>] [-o <maxobj>] [-a] [-s <starttime>]\n"
 	    "          [-C <cli_at_once>] [-w <waittime>] [-p nbprocs] [-S ip-ip:p-p]*\n"
-	    "          [-H \"<header>\"]* [-T <thinktime>] [-G <URL>] [-P <nbpages>] [-R]\n"
+	    "          [-H \"<header>\"]* [-T <thktime>] [-G <URL>] [-P <nbpages>] [-R] [-F]\n"
 	    "- users    : nombre de clients simultanes (=nb d'instances du scenario)\n"
 	    "- iter     : nombre maximal d'iterations a effectuer par client\n"
 	    "- waittime : temps (en ms) entre deux affichages des stats (0=jamais)\n"
@@ -1886,10 +1968,10 @@ void usage() {
 	    "- timeout  : timeout (en ms) sur un objet avant destruction du client\n"
 	    "- duration : duree maximale du test (en secondes)\n"
 	    "- maxobj   : nombre maximal d'objets en cours de lecture par client\n"
-	    "- maxsock  : nombre maximal de sockets utilisees\n"
+	    "- maxsock  : nombre maximal de sockets utilisees ; -c = fast close\n"
 	    "- [ -r ]   : ajoute 10%% de random sur le thinktime ; -R = regular think time.\n"
 	    "- [ -l ]   : passe en format de logs (plus large, pas de repetition de legende)\n"
-	    "- [ -a ]   : affiche la date absolue (uniquement avec -l)\n"
+	    "- [ -a ]   : affiche la date absolue (uniquement avec -l) ; -F = fast connect\n"
 	    "Ex: inject -H \"Host: www\" -T 1000 -G \"10.0.0.1:80/\" -o 4 -u 1\n"
 	    "Le fichier de scenario a pour syntaxe :\n"
 	    "host addr:port\n"
@@ -1932,6 +2014,10 @@ int main(int argc, char **argv) {
 		arg_regular_time = 1;
 	    else if (*flag == 'a')
 		arg_abs_time = 1;
+	    else if (*flag == 'F')
+		arg_fast_connect = 1;
+	    else if (*flag == 'c')
+		arg_fast_close = 1;
 	    else { /* 2+ args */
 		argv++; argc--;
 		if (argc == 0)
