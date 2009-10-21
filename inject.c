@@ -1146,12 +1146,12 @@ int EventWrite(int fd) {
 	    if (obj->vars)
 		r+=sprintf(r,"?%s", obj->vars);
 	    r+=sprintf(r," HTTP/1.0\r\n"
-		       "Host: %s\r\nUser-Agent: " USER_AGENT "\r\n"
-		       "Connection: close\r\n\r\n", obj->host);
+		       "Host: %s\r\nUser-Agent: " USER_AGENT "\r\n", obj->host);
 	    if (obj->page->client->cookie)
 		r+=sprintf(r, "Cookie: %s\r\n", obj->page->client->cookie);
 	    if (global_headers)
 		r+=sprintf(r, "%s", global_headers);
+	    r+=sprintf(r, "Connection: close\r\n\r\n");
 	}
 	else { /* meth = METH_POST */
 	    r+=sprintf(r,
