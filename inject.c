@@ -1,5 +1,18 @@
-/* Dernière modif: 2000/11/18 : correction du SEGV.
- * à réécrire en gérant des files d'attente suivant l'état des clients.
+/* 2000/11/18 : correction du SEGV.
+ * 2000/11/21 : grand nettoyage de l'automate et correction de nombreux bugs.
+ *
+ * Obs : parfois l'injecteur se bloque s'il y a peu de client. strace montre
+ *       que c'est parce qu'un connect() n'aboutit pas. Sans doute une table
+ *       de sockets qui se fige quelque part, ou un bug sur l'OS :-(
+ *       Voir la trace à la fin de ce fichier.
+ *
+ * TODO :
+ *  - réécrire en gérant des files d'attente suivant l'état des clients.
+ *  - gérer les unités d'affichage
+ *  - passer les data en long long
+ *  - traiter un timeout sur inactivité d'un client.
+ *  - terminaison automatique (et brutale) de l'injection au bout d'une durée
+ *
  */
 
 #include <stdio.h>
@@ -20,10 +33,9 @@
 #define METH_GET	1
 #define METH_POST	2
 
-#define STATUS_START	1
-#define STATUS_RUN	2
-#define STATUS_THINK	3
-#define STATUS_ERROR	4
+#define STATUS_RUN	1
+#define STATUS_THINK	2
+#define STATUS_ERROR	3
 
 #define BUFSIZE		4096
 #define MAXSOCK		10000
@@ -31,7 +43,7 @@
 
 
 /* show stats this every millisecond, 0 to disable */
-#define STATTIME	5000
+#define STATTIME	2000
 
 #define EV_READ 1
 #define EV_WRITE 2
@@ -40,7 +52,7 @@
 /* sur combien de bits code-t-on la taille d'un entier (ex: 32bits -> 5) */
 #define	INTBITS		5
 
-#define MINTIME(a,b)	(((a>0)&&(a)<(b))?(a):(b))
+#define MINTIME(old, new)	(((new)<0)?(old):(((old)<0||(new)<(old))?(new):(old)))
 
 struct pageobj {
     struct sockaddr_in addr;
@@ -100,7 +112,8 @@ struct scnobj  *curscnobj = NULL;
 char curscnhost[64]="host not set !";
 
 struct client *clients = NULL;
-unsigned long int nbclients=100;
+unsigned long int reqclients=0;
+unsigned long int nbclients=0;
 unsigned long int nbiterations, iterations=0;
 int injectdelay = 500;
 static struct timeval now={0,0};
@@ -112,8 +125,6 @@ long int totalhits=0;
 char trash[16384];
 char *scnfile = NULL;
 static struct timeval starttime = {0,0};
-static int needschedule = 0;
-static int reinject = 0;
 int maxfd = 0;
 int stopnow = 0;
 
@@ -124,6 +135,10 @@ fd_set ReadEvent[(MAXNBFD + FD_SETSIZE - 1) / FD_SETSIZE],
 
 fd_set StaticReadEvent[(MAXNBFD + FD_SETSIZE - 1) / FD_SETSIZE],
     StaticWriteEvent[(MAXNBFD + FD_SETSIZE - 1) / FD_SETSIZE];
+
+/*****  prototypes **********************************************/
+void destroyclient(struct client *client);
+/****************************************************/
 
 /***************** libtools ************************/
 
@@ -270,118 +285,6 @@ struct sockaddr_in *str2sa(char *str) {
     return &sa;
 }
 
-int stats(void *arg) {
-	static lines;
-	static struct timeval nextevt;
-	static unsigned long lasthits;
-	static unsigned long lastread;
-	static struct timeval lastevt;
-	unsigned long totaltime, deltatime;
-	if (tv_cmp(&now, &nextevt) >= 0) {
-		deltatime = (tv_delta(&now, &lastevt)?:1);
-		totaltime = (tv_delta(&now, &starttime)?:1);
-		if (lines++ % 16 == 0)
-		fprintf(stderr,"\n   time +delta clients    hits +delta hits/s  last     bytes +   delta  kB/s  last\n");
-
-		if (lines>1)
-			fprintf(stderr,"%7ld +%5ld %7ld %7ld +%5ld  %5ld %5ld %9ld +%8ld %5ld %5ld\n",
-				totaltime, deltatime,
-				iterations,
-				totalhits, totalhits-lasthits,
-				totalhits*1000/totaltime,
-				(totalhits-lasthits)*1000/deltatime,
-				totalread, totalread-lastread,
-				totalread/totaltime, (totalread-lastread)/deltatime);
-		
-		tv_delayfrom(&nextevt, &now, STATTIME);
-		lasthits=totalhits;
-		lastread=totalread;
-		lastevt=now;
-	}	
-	return STATTIME;
-}
-
-int SelectRun() {
-  int next_time, time2;
-  int status;
-  int fd;
-  struct timeval delta;
-
-  next_time=1;
-
-  while(!stopnow) {
-      goto injectmore;
-      while (needschedule) {
-          tv_now(&now);
-	  time2 = scheduler(NULL);
-	  next_time = MINTIME(time2, next_time);
-	  if (reinject) {
-	      reinject = 0;
-injectmore:
-              tv_now(&now);
-	      time2 = injecteur(NULL);
-	      next_time = MINTIME(time2, next_time);
-	  }
-      }
-#if STATTIME > 0
-      time2 = stats(NULL);
-      next_time = MINTIME(time2, next_time);
-#endif
-    /* Conversion en timeval */
-    delta.tv_sec=next_time/1000; 
-    delta.tv_usec=(next_time%1000)*1000;
-
-    /* on restitue l'etat des fdset */
-    memcpy(ReadEvent, StaticReadEvent, sizeof(ReadEvent));
-    memcpy(WriteEvent, StaticWriteEvent, sizeof(WriteEvent));
-
-    if (maxfd) {
-	/* On va appeler le select(). Si le temps fixé est nul, on considère que
-	   c'est un temps infini donc on passe NULL à select() au lieu de {0,0}.  */
-	status=select(maxfd, ReadEvent, WriteEvent, NULL, ((delta.tv_usec == 0) && (delta.tv_sec == 0)) ? NULL : &delta);
-
-	if (status > 0) { /* Appeller les events */
-
-	    int fds;
-	    char count;
-	    char closeit = 0;
-
-	    /* test sur les FD en lecture. On les parcourt 32 par 32 pour gagner du temps */
-	    for (fds = 0; (fds << INTBITS) < maxfd; fds++)
-		if ((((int *)(ReadEvent))[fds] | ((int *)(WriteEvent))[fds]) != 0)  /* au moins un FD non nul */
-		    for (count = 1<<INTBITS, fd = fds << INTBITS; count && fd < maxfd; count--, fd++) {
-
-			if (fdtab[fd] == NULL)
-			    continue;
-			closeit = 0;
-		    
-			if (!closeit && FD_ISSET(fd, WriteEvent))
-			    closeit |= EventWrite(fd);
-
-			if (!closeit && FD_ISSET(fd, ReadEvent))
-			    closeit |= EventRead(fd);
-
-			if (closeit) {
-			    close(fd);
-			    nbconn--;
-			    fdtab[fd]->page->objleft--;
-			    FD_CLR(fd, StaticReadEvent);
-			    FD_CLR(fd, StaticWriteEvent);
-			    fdtab[fd]->fd = 0;
-			    fdtab[fd]=NULL;
-			
-			    if (maxfd == fd+1) {   /* recompute maxfd */
-				while ((fd >= 0) && (fdtab[fd] == NULL))
-				    fd--;
-				maxfd = fd+1;
-			    }
-			}
-		    }
-	}
-    }
-  }
-}
-
 /* crée un objet pour une page :
    methode = { METH_GET | METH_POST } 
    addr    = ADRESSE:PORT
@@ -435,6 +338,49 @@ struct page *newpage(struct scnpage *scn, struct client *client) {
     return page;
 }
 
+/* démarre un client. Si une erreur se produit lors du démarrage, alors
+   les ressources sont libérées et le client est détruit.
+*/
+void start_client(struct client *cli) {
+    struct page *page;
+    struct pageobj *obj;
+
+    cli->status = STATUS_RUN;
+    if ((page = cli->current) == NULL) /* rien à ajouter */
+	return;
+
+    obj=page->objects;
+    while (obj) {
+	if ((obj->fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)) == -1) {
+	    fprintf(stderr, "impossible de créer une socket, destruction du client.\n");
+	    destroyclient(cli); /* renvoie un pointeur sur le suivant */
+	    return;
+	}
+	else
+	    nbconn++;
+	
+	if (fcntl(obj->fd, F_SETFL, O_NONBLOCK)==-1) {
+	    fprintf(stderr,"impossible de mettre la socket en O_NONBLOCK\n");
+	}
+	else if ((connect(obj->fd, &obj->addr, sizeof(obj->addr)) == -1) && (errno != EINPROGRESS)) {
+	    fprintf(stderr,"impossible de faire le connect() pour %d, destruction du client.\n", obj->fd);
+	    destroyclient(cli); /* renvoie un pointeur sur le suivant */
+	    return;
+	}
+	else {
+	    fdtab[obj->fd]=obj;
+	    FD_SET(obj->fd, StaticWriteEvent);
+	    
+	    if (obj->fd+1 > maxfd)
+		maxfd = obj->fd+1;
+	}
+	obj=obj->next;
+	page->objleft++;
+    }
+    /* le client est démarré */
+}
+
+
 void newclient(char *username, char *password) {
     struct client *newclient;
     struct page **page;
@@ -455,14 +401,13 @@ void newclient(char *username, char *password) {
 
     newclient->next = clients;
     newclient->cookie = NULL;
-    newclient->status = STATUS_START;
     newclient->current = newclient->pages;
-    clients = newclient;
+    start_client(clients = newclient);
 }
 
 /* detruit le client, libère ses fd encore ouverts, décompte le nombre de connexions
-   associées, décrémente le nombre de clients actifs et renvoie le pointeur sur le suivant */
-struct client *destroyclient(struct client *client) {
+   associées, et décrémente le nombre de clients actifs */
+void destroyclient(struct client *client) {
     struct page *page, *nextpage;
     struct pageobj *obj, *nextobj;
     struct client *liste;
@@ -513,11 +458,238 @@ struct client *destroyclient(struct client *client) {
 	free(client->username);
     if (client->password)
 	free(client->password);
-    liste = client->next;
-    free(client);
 
+    free(client);
     nbactcli--;
-    return liste;
+    return;
+}
+
+int stats(void *arg) {
+	static lines;
+	static struct timeval nextevt;
+	static unsigned long lasthits;
+	static unsigned long lastread;
+	static struct timeval lastevt;
+	unsigned long totaltime, deltatime;
+	if (tv_cmp(&now, &nextevt) >= 0) {
+		deltatime = (tv_delta(&now, &lastevt)?:1);
+		totaltime = (tv_delta(&now, &starttime)?:1);
+		if (lines++ % 16 == 0)
+		fprintf(stderr,"\n   time +delta clients    hits +delta hits/s  last     bytes +   delta  kB/s  last\n");
+
+		if (lines>1)
+			fprintf(stderr,"%7ld +%5ld %7ld %7ld +%5ld  %5ld %5ld %9ld +%8ld %5ld %5ld\n",
+				totaltime, deltatime,
+				iterations,
+				totalhits, totalhits-lasthits,
+				totalhits*1000/totaltime,
+				(totalhits-lasthits)*1000/deltatime,
+				totalread, totalread-lastread,
+				totalread/totaltime, (totalread-lastread)/deltatime);
+		
+		tv_delayfrom(&nextevt, &now, STATTIME);
+		lasthits=totalhits;
+		lastread=totalread;
+		lastevt=now;
+	}	
+	return tv_remain(&now, &nextevt);
+}
+
+static void onemoreclient() {
+    char uname[32];
+    sprintf(uname, "%d", clientid++);
+    /* on entre dans le scheduler directement à partir de ce client */
+    newclient(uname, uname);
+    nbactcli++;
+    iterations++;
+}
+
+/* ce scheduler s'occupe d'injecter des clients tant qu'il n'y en a pas assez, mais jamais
+   plus d'un tous les <injectdelay> ms
+*/
+static inline int injecteur(void *arg) {
+    static struct timeval next;
+
+    //    if
+    while
+	(nbactcli < nbclients)
+	onemoreclient();
+
+    if ((iterations == nbiterations) /* c'est la fin, on ne veut plus injecter */
+	|| (nbconn >= MAXSOCK) /* on ne peut plus injecter par manque de sockets */
+	|| (nbclients >= reqclients)) /* il y a assez de clients */
+	return -1;
+
+    if (tv_cmp(&next, &now) > 0)  /* on ne doit pas encore créer de nouveau client */
+	return tv_remain(&now, &next);
+
+    if (nbclients < reqclients)
+	nbclients++;
+
+    tv_delayfrom(&next, &now, injectdelay);
+    return injectdelay;
+}
+
+
+/*
+ * ce scheduler s'occupe de gérer les clients (think time, ...)
+ */
+int scheduler(void *arg) {
+    static struct timeval next;
+    struct client *cli, *nextcli;
+    unsigned int delay;
+
+    delay = -1;
+
+    nextcli = clients;
+    while ((cli = nextcli) != NULL) {
+	struct page *page;
+	struct pageobj *obj;
+
+	nextcli = cli->next;
+
+	if (cli->status == STATUS_RUN) {
+	    continue;
+	}
+	else if (cli->status == STATUS_THINK) {
+	    unsigned int del2;
+	    if ((del2 = tv_remain(&now, &cli->nextevent)) > 0) {  /* attendre avant de passer à la page suivante */
+		if (del2 < delay)
+		    delay = del2;
+		continue;
+	    }
+	    else {
+		page = cli->current = cli->current->next;
+		if (page == NULL) {  /* fin du scénario pour ce client */
+		    totalread += cli->dataread;
+		    totalhits += cli->hits;
+		    destroyclient(cli);
+		    continue;
+		}
+		else {
+		    start_client(cli);
+		    continue;
+		}
+	    }
+	}
+	else if ((cli->status == STATUS_ERROR) && (cli->current->objleft == 0)) {
+	    destroyclient(cli);
+	    continue;
+	}
+    }
+    
+    if
+	//    while
+	(nbactcli < nbclients) {
+	onemoreclient();
+    }
+
+    if ((nbactcli == 0) && (iterations == nbiterations)) {
+	int deltatime = (tv_delta(&now, &starttime)?:1);
+	printf("Fin: %ld clients ont généré %ld hits et chargé %ld octets en %ld ms soit %ld kB/s et %ld hits/s.\n",
+	    iterations, totalhits, totalread, deltatime, totalread/deltatime, totalhits*1000/deltatime);
+	exit(0);
+    }
+
+    tv_delayfrom(&next, &now, delay);
+
+#if 0
+    {
+	  struct timeval nowexit;
+	  tv_now(&nowexit);
+	  if (tv_delta(&now, &nowexit) > 10)
+	      printf("+de 10ms dans le scheduler\n");
+    }
+#endif
+    return delay;
+}
+
+int SelectRun() {
+  int next_time, time2;
+  int status;
+  int fd,i;
+  struct timeval delta;
+  int readnotnull, writenotnull;
+
+  while(!stopnow) {
+      next_time = -1;
+      tv_now(&now);
+
+      time2 = injecteur(NULL);
+      next_time = MINTIME(time2, next_time);
+	  
+      time2 = scheduler(NULL);
+      next_time = MINTIME(time2, next_time);
+	  
+#if STATTIME > 0
+      time2 = stats(NULL);
+      next_time = MINTIME(time2, next_time);
+#endif
+
+      if (next_time >= 0) {
+	  /* Convert to timeval */
+	  delta.tv_sec=next_time/1000; 
+	  delta.tv_usec=(next_time%1000)*1000;
+      }
+
+
+    /* on restitue l'etat des fdset */
+      //      memcpy(ReadEvent, StaticReadEvent, sizeof(ReadEvent));
+      //      memcpy(WriteEvent, StaticWriteEvent, sizeof(WriteEvent));
+
+      readnotnull = 0; writenotnull = 0;
+      for (i = 0; i < sizeof(ReadEvent)/sizeof(int); i++) {
+	  readnotnull |= (*((int*)ReadEvent+i) = *((int*)StaticReadEvent+i)) != 0;
+	  writenotnull |= (*((int*)WriteEvent+i) = *((int*)StaticWriteEvent+i)) != 0;
+      }
+      
+      /* On va appeler le select(). Si le temps fixé est nul, on considère que
+	 c'est un temps infini donc on passe NULL à select() au lieu de {0,0}.  */
+      status=select(maxfd,
+		    readnotnull ? ReadEvent : NULL,
+		    writenotnull ? WriteEvent : NULL,
+		    NULL,
+		    (next_time >= 0) ? &delta : NULL);
+      
+      if (status > 0) { /* Appeller les events */
+
+	  int fds;
+	  char count;
+	  char closeit = 0;
+	  
+	  /* test sur les FD en lecture. On les parcourt 32 par 32 pour gagner du temps */
+	  for (fds = 0; (fds << INTBITS) < maxfd; fds++)
+	      if ((((int *)(ReadEvent))[fds] | ((int *)(WriteEvent))[fds]) != 0)  /* au moins un FD non nul */
+		  for (count = 1<<INTBITS, fd = fds << INTBITS; count && fd < maxfd; count--, fd++) {
+		      
+		      if (fdtab[fd] == NULL)
+			  continue;
+		      closeit = 0;
+		      
+		      if (!closeit && FD_ISSET(fd, WriteEvent))
+			  closeit |= EventWrite(fd);
+		      
+		      if (!closeit && FD_ISSET(fd, ReadEvent))
+			  closeit |= EventRead(fd);
+		      
+		      if (closeit) {
+			  close(fd);
+			  nbconn--;
+			  fdtab[fd]->page->objleft--;
+			  FD_CLR(fd, StaticReadEvent);
+			  FD_CLR(fd, StaticWriteEvent);
+			  fdtab[fd]->fd = 0;
+			  fdtab[fd]=NULL;
+			  
+			  if (maxfd == fd+1) {   /* recompute maxfd */
+			      while ((fd >= 0) && (fdtab[fd] == NULL))
+				  fd--;
+			      maxfd = fd+1;
+			  }
+		      }
+		  }
+      }
+  }
 }
 
 /* creates a new scenario page, set its name and thinktime */
@@ -649,59 +821,60 @@ int EventWrite(int fd) {
     int data, ldata;
 
 
-    /* small optimization for the scheduler */
-    needschedule = 1;
     obj = fdtab[fd];
 
     ldata=sizeof(data);
     getsockopt(fd, SOL_SOCKET, SO_ERROR, &data, &ldata);
 
-    if (data > 0) {  /* erreur sur la socket */
+    if (data == 0) {  /* pas d'erreur sur la socket */
+	/* créer la requête */
+	if (obj->meth == METH_GET)  {
+	    r+=sprintf(r, "GET %s", obj->uri);
+	    if (obj->vars)
+		r+=sprintf(r,"?%s", obj->vars);
+	    r+=sprintf(r," HTTP/1.0\r\n");
+	    if (obj->page->client->cookie)
+		r+=sprintf(r, "Cookie: %s\r\n", obj->page->client->cookie);
+	    r+=sprintf(r, "Host: %s\r\n", obj->host);
+	    r+=sprintf(r,"\r\n");
+	}
+	else { /* meth = METH_POST */
+	    r+=sprintf(r, "POST %s HTTP/1.0\r\n", obj->uri);
+	    if (obj->page->client->cookie)
+		r+=sprintf(r, "Cookie: %s\r\n", obj->page->client->cookie);
+	    if (obj->vars) {		
+		r+=sprintf(r,"Content-length: %d\r\n",strlen(obj->vars));
+		r+=sprintf(r,"\r\n");
+		r+=sprintf(r, "%s", obj->vars);
+	    }
+	    else
+		r+=sprintf(r,"\r\n");
+	}
+	
+	/* la requete est maintenant prete */
+	if (write(fd, req, strlen(req)) != -1) {
+	    FD_SET(fd, StaticReadEvent);
+	    FD_CLR(fd, StaticWriteEvent);
+	    //	    shutdown(fd, SHUT_WR);
+	    return 0;
+	}
+	else {
+	    if (errno != EAGAIN) {
+		fprintf(stderr,"[Event] erreur sur le write().\n");
+		tv_now(&obj->page->end);
+		obj->page->client->status = obj->page->status = STATUS_ERROR;
+		return 1;
+	    }
+	    return 0;  /* erreur = EAGAIN */
+	}
+    }
+    else { /* erreur sur la socket */
 	fprintf(stderr,"[Event] erreur sur le connect() : %d\n",data);
 	tv_now(&obj->page->end);
 	obj->page->client->status = obj->page->status = STATUS_ERROR;
-	//needschedule=1;
 	return 1;
     }
 
-    /* créer la requête */
-    if (obj->meth == METH_POST) {	    
-	r+=sprintf(r, "POST %s HTTP/1.0\r\n", obj->uri);
-	if (obj->page->client->cookie)
-	    r+=sprintf(r, "Cookie: %s\r\n", obj->page->client->cookie);
-	if (obj->vars) {		
-	    r+=sprintf(r,"Content-length: %d\r\n",strlen(obj->vars));
-	    r+=sprintf(r,"\r\n");
-	    r+=sprintf(r, "%s", obj->vars);
-	}
-	else
-	    r+=sprintf(r,"\r\n");
-    }
-    else /* meth = METH_GET */ {
-	r+=sprintf(r, "GET %s", obj->uri);
-	if (obj->vars)
-	    r+=sprintf(r,"?%s", obj->vars);
-	r+=sprintf(r," HTTP/1.0\r\n");
-	if (obj->page->client->cookie)
-	    r+=sprintf(r, "Cookie: %s\r\n", obj->page->client->cookie);
-	r+=sprintf(r, "Host: %s\r\n", obj->host);
-	r+=sprintf(r,"\r\n");
-    }
-    /* la requete est maintenant prete */
-    if (write(fd, req, strlen(req)) == -1) {
-	if (errno != EAGAIN) {
-	    fprintf(stderr,"[Event] erreur sur le write().\n");
-	    tv_now(&obj->page->end);
-	    obj->page->client->status = obj->page->status = STATUS_ERROR;
-	    //needschedule=1;
-	    return 1;
-	}
-    }
-    else {
-	FD_SET(fd, StaticReadEvent);
-	FD_CLR(fd, StaticWriteEvent);
-    }
-    return 0;
 }
 
 
@@ -712,8 +885,6 @@ int EventRead(int fd) {
     char *r = req;
     struct pageobj *obj;
 
-    /* small optimization for the scheduler */
-    needschedule = 1;
     obj = fdtab[fd];
 
     do {
@@ -739,12 +910,13 @@ int EventRead(int fd) {
 	    char *ptr1, *ptr2, *cookie, *ptr3;
 	    char *header;
 	    /* lire les headers pour savoir s'il y a un cookie */
-	    ptr1=obj->buf;
-	    while (ptr1<obj->read) {
+	    ptr1 = obj->buf;
+	    while (ptr1 < obj->read) {
 		/* si on a un saut de ligne ici, c'est forcément une fin de headers */
 		if ((*ptr1 == '\r') || (*ptr1 == '\n'))
 		    break;
-		ptr2=ptr1;
+
+		ptr2 = ptr1;
 
 		/* recherche la fin de la chaine */
 		while ((ptr1<obj->read) && (*ptr1 != '\n') && (*ptr1 != '\r'))
@@ -809,7 +981,6 @@ int EventRead(int fd) {
 		tv_wait(&obj->page->client->nextevent, obj->page->thinktime);
 		if (obj->page->client->status != STATUS_ERROR) {
 		    obj->page->client->status = obj->page->status = STATUS_THINK;
-		    //needschedule=1;
 		}
 	    }
 	    else {
@@ -822,151 +993,11 @@ int EventRead(int fd) {
 	else if ((ret == -1) && (errno != EAGAIN)) {
 	    // Log(LOG_LDEBUG,"[Event] erreur, arrêt du client <%p>.\n", obj->page->client);
 	    obj->page->client->status = STATUS_ERROR;
-	    //needschedule=1;
 	    return 1;
 	}
     } while (moretoread);
     /* sinon c'est un EAGAIN, pas grave */
     return 0;
-}
-
-/* ce scheduler s'occupe d'injecter des clients tant qu'il n'y en a pas assez, mais jamais
-   plus d'un tous les <injectdelay> ms
-*/
-int injecteur(void *arg) {
-    static struct timeval next;
-    unsigned int delay;
-    char uname[32];
-
-    if (nbconn < MAXSOCK) {
-	if ((nbactcli < nbclients)  && (iterations < nbiterations)
-	    && (tv_cmp(&next, &now) <= 0)) {  /* on doit créer un nouveau client */
-	    sprintf(uname, "%d", clientid++);
-	    /* on entre dans le scheduler directement à partir de ce client */
-	    newclient(uname, uname);
-	    nbactcli++;
-
-	    delay=injectdelay;
-	    tv_delayfrom(&next, &now, injectdelay);
-	    iterations++;
-	    needschedule = 1;
-	}
-	else
-	    delay=tv_delta(&next, &now);
-    }
-    else {
-	//	Log(LOG_LWARN, "Plus de socket, patienter 1 seconde.\n");
-	delay = 1000;  /* 1 seconde si plus de sockets */
-    }
-
-    return delay;
-}
-
-
-/*
- * ce scheduler s'occupe de gérer les clients (think time, ...)
- */
-int scheduler(void *arg) {
-    static struct timeval next;
-    struct client *cli;
-    unsigned int delay;
-    char uname[32];
-    int sock;
-
-    cli = clients;
-    delay=tv_remain(&now, &next);
-
-    if (!needschedule && delay>0)
-	return delay;
-
-    needschedule = 0;
-
-    while (cli) {
-	struct page *page;
-	struct pageobj *obj;
-
-	if (cli->status == STATUS_RUN) {
-	    goto nextclient;
-	}
-	else if (cli->status == STATUS_THINK) {
-	    unsigned int del2;
-	    if ((del2 = tv_remain(&now, &cli->nextevent)) > 0) {  /* attendre avant de passer à la page suivante */
-		if (del2 < delay)
-		    delay = del2;
-		goto nextclient;
-	    }
-	    else {
-		page = cli->current = cli->current->next;
-		if (page == NULL) {  /* fin du scénario pour ce client */
-		    totalread += cli->dataread;
-		    totalhits += cli->hits;
-		    cli=destroyclient(cli);
-		    reinject = 1;  /* on peut avoir à relancer des clients */
-		    goto loopclient;
-		}
-		else {
-		    cli->status = STATUS_START;  /* on repart tout de suite en start */
-		    goto faststart;
-		}
-	    }
-	}
-	else if (cli->status == STATUS_START) {  /* envoyer une nouvelle page */
-	    page = cli->current;
-	    if (page) {
-faststart:
-		obj=page->objects;
-		while (obj) {
-		    if ((obj->fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)) == -1) {
-			fprintf(stderr, "impossible de créer une socket, destruction du client.\n");
-		        cli=destroyclient(cli);
-			reinject = 1;  /* on peut avoir à relancer des clients */
-
-		        goto loopclient;
-		    }
-		    else
-			nbconn++;
-			
-		    if (fcntl(obj->fd, F_SETFL, O_NONBLOCK)==-1) {
-			fprintf(stderr,"impossible de mettre la socket en O_NONBLOCK\n");
-		    }
-		    else if ((connect(obj->fd, &obj->addr, sizeof(obj->addr)) == -1) && (errno != EINPROGRESS)) {
-			fprintf(stderr,"impossible de faire le connect() pour %d, destruction du client.\n", obj->fd);
-		        cli=destroyclient(cli);
-			reinject = 1;  /* on peut avoir à relancer des clients */
-		        goto loopclient;
-		    }
-		    else {
-			fdtab[obj->fd]=obj;
-			FD_SET(obj->fd, StaticWriteEvent);
-
-			if (obj->fd+1 > maxfd)
-			    maxfd = obj->fd+1;
-		    }
-		    obj=obj->next;
-		    page->objleft++;
-		}
-	    }
-	    cli->status = STATUS_RUN;
-	}
-	else if ((cli->status == STATUS_ERROR) && (cli->current->objleft == 0)) {
-	    cli=destroyclient(cli);
-	    reinject = 1;  /* on peut avoir à relancer des clients */
-	    goto loopclient;
-	}
-
-nextclient:
-	cli = cli->next;
-loopclient:
-    }
-
-    if ((nbactcli == 0) && (iterations == nbiterations)) {
-	int deltatime = (tv_delta(&now, &starttime)?:1);
-	printf("Fin: %ld clients ont généré %ld hits et chargé %ld octets en %ld ms soit %ld kB/s et %ld hits/s.\n",
-	    iterations, totalhits, totalread, deltatime, totalread/deltatime, totalhits*1000/deltatime);
-	exit(0);
-    }
-
-    return delay;
 }
 
 
@@ -1007,8 +1038,9 @@ int main(int argc, char **argv) {
 		"new pageYYY <think time ...>\n");
 	exit(1);
     }
-    nbclients = atol(argv[1]);
-    nbiterations = atol(argv[2]) * nbclients;
+    reqclients = atol(argv[1]);
+    nbclients = 1;
+    nbiterations = atol(argv[2]) * reqclients;
     injectdelay = atol(argv[3]);
     scnfile = argv[4];
 
@@ -1030,3 +1062,30 @@ int main(int argc, char **argv) {
 	   iterations, totalhits, totalread, deltatime, totalread/deltatime, totalhits*1000/deltatime);
     return 0;
 }
+
+
+/*
+ * Trace du probleme du connect().
+ * Injecteur sur un kernel 2.4.0test11, serveur sur un 2.2.18-22wt4.
+ * --> Voir la socket 4 : elle ne se débloque jamais.
+ *
+ * socket(PF_INET, SOCK_STREAM, IPPROTO_TCP) = 4
+ * fcntl(4, F_SETFL, O_RDONLY|O_NONBLOCK)  = 0
+ * connect(4, {sin_family=AF_INET, sin_port=htons(10000), sin_addr=inet_addr("10.101.23.11")}}, 16) = -1 EINPROGRESS (Operation now in progress)
+ * select(5, NULL, [3 4], NULL, {0, 748000}) = 1 (out [3], left {0, 750000})
+ * getsockopt(3, SOL_SOCKET, SO_ERROR, [0], [4]) = 0
+ * write(3, "GET /1k HTTP/1.0\r\nHost: 10.101.2"..., 46) = 46
+ * gettimeofday({974847718, 831384}, NULL) = 0
+ * select(5, [3], [4], NULL, {0, 746000})  = 1 (in [3], left {0, 750000})
+ * read(3, "HTTP/1.0 200 OK\nContent-Length: "..., 4096) = 38
+ * read(3, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"..., 4058) = 1024
+ * read(3, "", 3034)                       = 0
+ * close(3)                                = 0
+ * gettimeofday({974847718, 832247}, NULL) = 0
+ * select(5, NULL, [4], NULL, {0, 745000}) = 0 (Timeout)
+ * gettimeofday({974847719, 577047}, NULL) = 0
+ * select(5, NULL, [4], NULL, {0, 0})      = 0 (Timeout)
+ * gettimeofday({974847719, 577262}, NULL) = 0
+
+
+ */
