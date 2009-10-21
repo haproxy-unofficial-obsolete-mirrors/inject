@@ -1041,18 +1041,21 @@ static inline int injecteur(void *arg) {
 	else {
 	    if (nbclients == 0) {
 		SETNOW(&next); /* base for next step computation */
+		tv_delayfrom(&next, &next, arg_slowstart); /* next time we add that many clients */
 		nbclients += arg_stepsize;
 	    }
 	    else {
 		unsigned long times;
-		times = tv_remain(&next, &now) / arg_slowstart; /* client needed during elapsed time since last visiting */
-		if (times > 0) {
-		    tv_delayfrom(&next, &next, times * arg_slowstart); /* decrement remaining time, but delay it for 1 iteration */
-		    nbclients += times * arg_stepsize;
+		delay = tv_remain(&now, &next);
+		if (!delay) {
+			nbclients += arg_stepsize;
+			tv_delayfrom(&next, &next, arg_slowstart);
 		}
 	    }
 	    if (nbclients > arg_nbclients)
-		nbclients = arg_nbclients;
+		    nbclients = arg_nbclients;
+	    else
+		    delay = -1;
 	    delay = tv_remain(&now, &next);
 	}
     }
