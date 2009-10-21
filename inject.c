@@ -1,5 +1,5 @@
 /*
- * Injecteur HTTP simple - (C) 2000-2002 Willy Tarreau <willy@ant-computing.com>
+ * Injecteur HTTP simple - (C) 2000-2004 Willy Tarreau <willy@ant-computing.com>
  * Utilisation et redistribution soumises a la licence GPL.
  *
  * 2000/11/18 : correction du SEGV.
@@ -24,6 +24,7 @@
  *		Il faudrait refaire la partie serveur (voir haproxy) pour libérer les headers
  *		aussitôt que possible, et lire les data à la volée.
  * 2004/05/14 : ajout de l'option '-a' pour afficher la date absolue.
+ * 2004/09/26 : passage en mode multi-processus
  *
  * Remarque : le champ "variables" HTTP peut contenir 2 "%s" qui seront remplacés par l'id du client
  *            et son mot de passe (=id)
@@ -77,6 +78,9 @@
 #include <stdarg.h>
 #include <sys/resource.h>
 #include <time.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
+#include <math.h>
 
 #ifndef TCP_NODELAY
 #define TCP_NODELAY	1
@@ -92,9 +96,6 @@
 
 #define OBJ_STNEW	-1
 #define OBJ_STTERM	-2
-
-// no read should be smaller than the smallest TCP MSS
-#define MIN_READ_SIZE	0
 
 #define BUFSIZE		4096
 #define TRASHSIZE	65536
@@ -186,6 +187,7 @@ unsigned long int arg_nbclients=0;
 unsigned long int nbclients=0;
 unsigned int arg_maxobj = 8;
 unsigned long int arg_maxiter=0;
+int arg_nbprocs = 1;
 int arg_slowstart = 0;
 int arg_stattime = STATTIME;
 int arg_maxsock = 1000;
@@ -200,21 +202,29 @@ static int one = 1;
 int nbconn=0;
 int clientid=0;
 int nbactcli=0;
+int shmid=0;
+char *shmaddr=NULL;
 
-unsigned long long int totalread=0;
-unsigned long int totalhits=0;
-unsigned long int totalerr=0;
-unsigned long int totaltout=0;
-unsigned long int iterations=0;
-unsigned long int stat_htime=0, stat_hits=0;
-unsigned long int stat_ptime=0, stat_pages=0;
-float moy_htime = 0.0, moy_ptime = 0.0;
+
+/* stats[0] = global. stats[x]=per thread */
+struct stats {
+    unsigned long long int totalread;
+    unsigned long int totalhits;
+    unsigned long int totalerr;
+    unsigned long int totaltout;
+    unsigned long int iterations;
+    unsigned long int stat_hits;
+    unsigned long int stat_ptime, stat_pages;
+    double moy_htime, moy_sdhtime, moy_ptime;
+    double tot_htime, tot_sqhtime;	/* utilisés pour le calcul de l'écart-type */
+} *stats = NULL;
 
 char trash[TRASHSIZE];
 static struct timeval starttime = {0,0};
 static struct timeval stoptime = {0,0};
 
 int maxfd = 0;
+int thr = 0;
 int stopnow = 0;
 static struct pageobj **fdtab;
 
@@ -625,7 +635,7 @@ static inline int onemoreclient() {
     if (newclient(uname, uname) == 0)
 	return 0;
 
-    iterations++;
+    stats[thr].iterations++;
     return 1;
 }
 
@@ -693,7 +703,7 @@ void destroyclient(struct client *client, struct client *prev) {
     nbactcli--;
 
     while (nbactcli < nbclients) {
-	if ((arg_maxiter > 0) && (iterations >= arg_maxiter)) {
+	if ((arg_maxiter > 0) && (stats[thr].iterations >= arg_maxiter)) {
 		if (nbactcli == 0)
 			stopnow = 1;
 		break;
@@ -706,7 +716,7 @@ void destroyclient(struct client *client, struct client *prev) {
     return;
 }
 
-int stats(void *arg) {
+int show_stats(void *arg) {
 	static int lines;
 	static struct timeval nextevt;
 	static unsigned long lasthits;
@@ -718,55 +728,107 @@ int stats(void *arg) {
 	    tv_now(&nextevt);
 
 	if (tv_cmp(&now, &nextevt) >= 0) {
+	    unsigned long long int totalread=0;
+	    unsigned long int totalhits=0;
+	    unsigned long int totalerr=0;
+	    unsigned long int totaltout=0;
+	    unsigned long int iterations=0;
+	    unsigned long int stat_hits=0;
+	    unsigned long int stat_ptime=0, stat_pages=0;
+	    double tot_htime=0, tot_sqhtime=0;
+
+		int t;
 		deltatime = (tv_delta(&now, &lastevt)?:1);
 		if ((starttime.tv_sec | starttime.tv_usec) == 0)
 		    totaltime = -1;
 		else
 		    totaltime = (tv_delta(&now, &starttime)?:1);
-		
-		if (stat_hits)
-		    moy_htime = 0.8 * moy_htime + ((moy_htime == 0.0) ? 1.0 : 0.2) * (float)stat_htime/(float)stat_hits;
 
-		if (stat_pages)
-		    moy_ptime = 0.8 * moy_ptime + ((moy_ptime == 0.0) ? 1.0 : 0.2) * (float)stat_ptime/(float)stat_pages;
+
+		for (t = 1; t <= arg_nbprocs; t++) {
+		    unsigned long long int tr1, tr2;
+
+		    tr1 = stats[t].totalread;
+		    totalhits  += stats[t].totalhits;
+		    totalerr   += stats[t].totalerr;
+		    totaltout  += stats[t].totaltout;
+		    iterations += stats[t].iterations;
+		    tot_htime  += stats[t].tot_htime;		    stats[t].tot_htime = 0;
+		    tot_sqhtime+= stats[t].tot_sqhtime;	 	    stats[t].tot_sqhtime = 0;
+		    stat_ptime += stats[t].stat_ptime;		    stats[t].stat_ptime = 0;
+		    stat_hits  += stats[t].stat_hits;		    stats[t].stat_hits = 0;
+		    stat_pages += stats[t].stat_pages;		    stats[t].stat_pages = 0;
+		    /* try to avoid inter-thread race without any lock */
+		    tr2 = stats[t].totalread;
+		    if ((tr2 & 0xffffffff) < (tr1 & 0xffffffff)) {
+			tr2 = tr1;
+		    }
+		    totalread += tr2;
+		}
+
+		stats[0].totalread   = totalread;
+		stats[0].totalhits   = totalhits;
+		stats[0].totalerr    = totalerr;
+		stats[0].totaltout   = totaltout;
+		stats[0].iterations  = iterations;
+		stats[0].tot_htime   = tot_htime;
+		stats[0].tot_sqhtime = tot_sqhtime;
+		stats[0].stat_ptime  = stat_ptime;
+		stats[0].stat_hits  += stat_hits;
+		stats[0].stat_pages += stat_pages;
+
+		/*
+		 * standard deviation = sqrt(sum(x-moy)^2/n) = sqrt((sum(x^2)-2*moy*sum(x))/n + moy^2)
+		 */
+		if (stats[0].stat_hits) {
+		    stats[0].moy_htime = stats[0].tot_htime / (double)stats[0].stat_hits;
+		    stats[0].moy_sdhtime =
+			sqrt(
+			     (stats[0].tot_sqhtime
+			      - 2*stats[0].moy_htime*stats[0].tot_htime) / (double)stats[0].stat_hits
+			     + stats[0].moy_htime * stats[0].moy_htime);
+		}
+		else
+		    stats[0].moy_sdhtime = stats[0].moy_htime = stats[0].moy_ptime = 0;
+
+		if (stats[0].stat_pages)
+		    stats[0].moy_ptime = (float)stats[0].stat_ptime/(float)stats[0].stat_pages;
 
 
 		if ((lines++ % 16 == 0) && !arg_log)
 		    fprintf(stderr,
 			    "\n   hits ^hits"
 			    " hits/s  ^h/s     bytes  kB/s"
-			    "  last  errs  tout htime ptime\n");
+			    "  last  errs  tout htime  sdht ptime\n");
 		if (lines>1) {
-		    if (arg_log) {
-			fprintf(stdout,"%7ld %5ld %7ld %7ld %5ld  %5ld %5ld %9lld %8lld %5ld %5ld %5ld %5ld %03.1f %03.1f %5d\n",
+		    if (arg_log)
+			fprintf(stdout,"%7ld %5ld %7ld %7ld %5ld  %5ld %5ld %9lld %8lld %5ld %5ld %5ld %5ld %03.1f %3.1f %03.1f %5d\n",
 				arg_abs_time ? now.tv_sec + (now.tv_usec >= 500000) : totaltime, deltatime,
-				iterations,
-				totalhits, stat_hits/*totalhits-lasthits*/,
-				(unsigned long)((unsigned long long)totalhits*1000ULL/totaltime),
-				stat_hits/*(totalhits-lasthits)*/*1000/deltatime,
-				totalread, totalread-lastread,
-				(long)(totalread/(unsigned long long)totaltime),
-				(long)((totalread-lastread)/(unsigned long long)deltatime),
-				totalerr, totaltout,
-				moy_htime, moy_ptime, nbactcli);
-                        fflush(stdout);
-		    }
+				stats[0].iterations,
+				stats[0].totalhits, stats[0].stat_hits/*totalhits-lasthits*/,
+				(unsigned long)((unsigned long long)stats[0].totalhits*1000ULL/totaltime),
+				stats[0].stat_hits/*(totalhits-lasthits)*/*1000/deltatime,
+				stats[0].totalread, stats[0].totalread-lastread,
+				(long)(stats[0].totalread/(unsigned long long)totaltime),
+				(long)((stats[0].totalread-lastread)/(unsigned long long)deltatime),
+				stats[0].totalerr, stats[0].totaltout,
+				stats[0].moy_htime, stats[0].moy_sdhtime, stats[0].moy_ptime, nbactcli);
 		    else
-			fprintf(stderr,"%7ld %5ld  %5ld %5ld %9lld %5ld %5ld %5ld %5ld %03.1f %03.1f\n",
-				totalhits, stat_hits/*totalhits-lasthits*/,
-				(unsigned long)((unsigned long long)totalhits*1000ULL/totaltime),
-				stat_hits/*(totalhits-lasthits)*/*1000/deltatime,
-				totalread,
-				(long)(totalread/(unsigned long long)totaltime),
-				(long)((totalread-lastread)/(unsigned long long)deltatime),
-				totalerr, totaltout,
-				moy_htime, moy_ptime);
+			fprintf(stderr,"%7ld %5ld  %5ld %5ld %9lld %5ld %5ld %5ld %5ld %03.1f %3.1f %03.1f\n",
+				stats[0].totalhits, stats[0].stat_hits/*totalhits-lasthits*/,
+				(unsigned long)((unsigned long long)stats[0].totalhits*1000ULL/totaltime),
+				stats[0].stat_hits/*(totalhits-lasthits)*/*1000/deltatime,
+				stats[0].totalread,
+				(long)(stats[0].totalread/(unsigned long long)totaltime),
+				(long)((stats[0].totalread-lastread)/(unsigned long long)deltatime),
+				stats[0].totalerr, stats[0].totaltout,
+				stats[0].moy_htime, stats[0].moy_sdhtime, stats[0].moy_ptime);
 		}
 		else if (arg_log) { /* print it once */
 				    fprintf(stderr,
 					    "   time delta clients    hits ^hits"
 					    " hits/s  ^h/s     bytes   ^bytes  kB/s"
-					    "  last  errs  tout htime ptime nbcli\n");
+					    "  last  errs  tout htime  sdht ptime nbcli\n");
 		}
 		if (totaltime > 0)
 		    deltatime = arg_stattime - totaltime % arg_stattime; /* correct imprecision */
@@ -777,14 +839,15 @@ int stats(void *arg) {
 		    deltatime += arg_stattime;
 
 		tv_delayfrom(&nextevt, &now, deltatime);
-		lasthits=totalhits;
-		lastread=totalread;
+		lasthits=stats[0].totalhits;
+		lastread=stats[0].totalread;
 		lastevt=now;
-		stat_hits = stat_htime = 0;
-		stat_pages = stat_ptime = 0;
+		stats[0].stat_hits  = 0;
+		stats[0].stat_pages = stats[0].stat_ptime = 0;
+		stats[0].tot_htime = stats[0].tot_sqhtime = 0;
 
 		if ((arg_maxtime > 0 && tv_cmp_ms(&stoptime, &now) < 0)
-		    /*|| (arg_maxiter > 0 && iterations > arg_maxiter)*/)
+		    /*|| (arg_maxiter > 0 && stats[0].iterations > arg_maxiter)*/)
 		    stopnow=1;  /* bench must terminate now */
 	}	
 	return tv_remain(&now, &nextevt);
@@ -797,7 +860,7 @@ static inline int injecteur(void *arg) {
     static struct timeval next;
     int delay = -1;
 
-    if ((arg_maxiter > 0) && (iterations >= arg_maxiter)) /* c'est la fin, on ne veut plus injecter */
+    if ((arg_maxiter > 0) && (stats[thr].iterations >= arg_maxiter)) /* c'est la fin, on ne veut plus injecter */
 	return -1;
 
     if (nbclients < arg_nbclients) {
@@ -854,7 +917,7 @@ int scheduler(void *arg) {
 		    delay = MINTIME(del2, delay);
 		}
 		else {
-		    totaltout++;
+		    stats[thr].totaltout++;
 		    destroyclient(cli, prev);
 		    continue;
 		}
@@ -875,12 +938,12 @@ int scheduler(void *arg) {
 	    }
 	    else {
 #ifndef PER_CLIENT_STATS
-		//		totalread += cli->current->dataread;
+		//		stats[thr].totalread += cli->current->dataread;
 #endif
 		if ((cli->pages = cli->pages->next) == NULL) { /* fin du scénario pour ce client */
 #ifdef PER_CLIENT_STATS
-		    //		    totalread += cli->dataread;
-		    totalhits += cli->hits;
+		    //		    stats[thr].totalread += cli->dataread;
+		    stats[thr].totalhits += cli->hits;
 #endif
 		    destroyclient(cli, prev);
 		    continue;
@@ -896,7 +959,7 @@ int scheduler(void *arg) {
 	    }
 	}
 	else if ((cli->status == STATUS_ERROR) /*&& (cli->current->actobj == 0)*/) {
-	    totalerr++;
+	    stats[thr].totalerr++;
 	    destroyclient(cli, prev);
 	    continue;
 	}
@@ -920,7 +983,7 @@ void SelectRun() {
   int next_time, time2;
   int status;
   int fd,i;
-  struct timeval delta, delta_cp;
+  struct timeval delta;
   int readnotnull, writenotnull;
 
   while (!stopnow) {
@@ -935,8 +998,9 @@ void SelectRun() {
       time2 = scheduler(NULL);
       next_time = MINTIME(time2, next_time);
 	  
+      /* arg_stattime is forced to zero on thr>1 */
       if (arg_stattime > 0) {
-	  time2 = stats(NULL);
+	  time2 = show_stats(NULL);
 	  next_time = MINTIME(time2, next_time);
       }
 
@@ -968,30 +1032,13 @@ void SelectRun() {
 #endif
       /* On va appeler le select(). Si le temps fixé est nul, on considère que
 	 c'est un temps infini donc on passe NULL à select() au lieu de {0,0}.  */
-      delta_cp = delta;
       status=select(maxfd,
 		    readnotnull ? ReadEvent : NULL,
 		    writenotnull ? WriteEvent : NULL,
 		    NULL,
 		    (next_time >= 0) ? &delta : NULL);
       
-#ifdef USE_SELECT_REMAINING_TIME
-      if (next_time >= 0) {
-         /* this is possible on linux only */
-         now.tv_sec  += delta_cp.tv_sec - delta.tv_sec;
-         now.tv_usec += delta_cp.tv_usec - delta.tv_usec;
-         while ((signed long)now.tv_usec < 0) {
-            now.tv_usec += 1000000;
-            now.tv_sec --;
-         }
-         while ((signed long)now.tv_usec >= 1000000) {
-            now.tv_usec -= 1000000;
-            now.tv_sec ++;
-         }
-      } else
-#endif
-         tv_now(&now);
-
+      tv_now(&now);
       if (status > 0) { /* Appeller les events */
 
 	  int fds;
@@ -1278,8 +1325,6 @@ int EventRead(int fd) {
 #else
 	    ret=recv(fd, trash, readsz,MSG_NOSIGNAL/*|MSG_WAITALL*/);  /* lire les data mais ne pas les stocker */
 #endif
-	    if (ret == readsz || ret >= MIN_READ_SIZE)
-	       moretoread=1;
 	} else {
             int readsz = BUFSIZE - (obj->read - obj->buf);
 #ifndef MSG_NOSIGNAL
@@ -1287,11 +1332,8 @@ int EventRead(int fd) {
 #else
 	    ret=recv(fd, obj->read, readsz, MSG_NOSIGNAL/*|MSG_WAITALL*/); /* lire et stocker les data */
 #endif
-	    if (ret > 0) {
+	    if (ret > 0)
 		obj->read += ret;
-	        if (ret == readsz || ret >= MIN_READ_SIZE)
-	            moretoread=1;
-            }
 	}
 
 	if (ret > 0) {
@@ -1300,19 +1342,20 @@ int EventRead(int fd) {
 
 	    obj->page->dataread+=ret;
 	    obj->page->client->dataread+=ret;
-	    totalread += ret;
+	    stats[thr].totalread += ret;
 
-	    if (!moretoread)
-		goto mustclose;
+	    moretoread = 1;
 	}
 	else if ((ret == 0) || (ret == -1 && errno == ECONNRESET)) {
 	    char *ptr1, *ptr2, *cookie, *ptr3;
-	    char *header;
-mustclose:
+	    unsigned long delta;
+	    //char *header;
 
 	    /* on relève les mesures le plus tôt possible */
-	    stat_htime += tv_delta(&obj->starttime, &now);
-	    stat_hits ++;
+	    delta = tv_delta(&obj->starttime, &now);
+	    stats[thr].tot_htime += delta;
+	    stats[thr].tot_sqhtime += delta*delta;
+	    stats[thr].stat_hits ++;
 
 #ifndef DONT_ANALYSE_HTTP_HEADERS
 
@@ -1456,7 +1499,7 @@ mustclose:
 #endif
 
 #ifndef PER_CLIENT_STATS
-	    totalhits ++;
+	    stats[thr].totalhits ++;
 #endif
 
 	    if (obj->page->objleft == 1) {  /* dernier objet de cette page */
@@ -1466,8 +1509,8 @@ mustclose:
 		tv_delayfrom(&obj->page->client->nextevent, &now, obj->page->thinktime);
 		if (obj->page->client->status != STATUS_ERROR) {
 		    obj->page->client->status = obj->page->status = STATUS_THINK;
-		    stat_ptime += tv_delta(&obj->page->begin, &now);
-		    stat_pages ++;
+		    stats[thr].stat_ptime += tv_delta(&obj->page->begin, &now);
+		    stats[thr].stat_pages ++;
 		}
 	    }
 	    else {
@@ -1513,7 +1556,7 @@ void usage() {
     fprintf(stderr,
 	    "Syntaxe : inject -u <users> -f <scnfile> [ -i <iter> ] [ -d <duration> ] [ -l ]\n"
 	    "          [ -r ] [ -t <timeout> ] [ -n <maxsock> ] [ -o <maxobj> ] [ -a ]\n"
-	    "          [ -s <starttime> ] [ -w <waittime> ]\n"
+	    "          [ -s <starttime> ] [ -w <waittime> ] [ -p nbprocs ] \n"
 	    "- users    : nombre de clients simultanes (=nb d'instances du scenario)\n"
 	    "- iter     : nombre maximal d'iterations a effectuer par client\n"
 	    "- waittime : temps (en ms) entre deux affichages des stats (0=jamais)\n"
@@ -1540,6 +1583,7 @@ int main(int argc, char **argv) {
     long int deltatime;
     time_t launch_time;
     struct tm *tm;
+    int t;
     int orig_argc = argc;
     char **orig_argv = argv;
     char *mois[12]={"Jan","Fev","Mar","Avr","Mai","Juin",
@@ -1570,6 +1614,7 @@ int main(int argc, char **argv) {
 		    usage();
 
 		switch (*flag) {
+		case 'p' : arg_nbprocs = atol(*argv); break;
 		case 't' : arg_timeout = atol(*argv); break;
 		case 'u' : arg_nbclients = atol(*argv); break;
 		case 'i' : arg_maxiter = atol(*argv); break;
@@ -1625,14 +1670,42 @@ int main(int argc, char **argv) {
     fdtab = (struct pageobj **)calloc(1,
 		sizeof(struct pageobj *) * (arg_maxsock + 3));
 
-    signal(SIGINT, sighandler);
+
+    shmid=shmget(IPC_PRIVATE, sizeof(struct stats)*(1+arg_nbprocs), IPC_CREAT);
+    shmaddr=shmat(shmid, NULL, 0);
+    stats=(void *)shmaddr;
+    if (stats == (void *)-1) {
+	stats = (struct stats *)calloc(1+arg_nbprocs, sizeof(struct stats));
+        printf("shmid = %d, shmaddr = %p, stats = %p\n", shmid, shmaddr, stats);
+	printf("shmat error, retry as root or do not use multi-process.\n");
+	exit(1);
+    }
+    memset(stats, 0, sizeof(struct stats)*(1+arg_nbprocs));
+    shmctl(shmid, IPC_RMID, NULL);
 
     time(&launch_time); tm=localtime(&launch_time);
     tv_now(&now);
     tv_delayfrom(&stoptime, &now, arg_maxtime * 1000);
 
-    SelectRun();
+    signal(SIGINT, sighandler);
 
+    if (arg_nbprocs > 1) {
+
+        for (t = 1; t <= arg_nbprocs; t++) {
+	    if (t > 1) {
+		thr=t;
+	        if (fork() == 0) {
+	            /* only one thread does the stats */
+		    arg_stattime = 0;
+		    SelectRun();
+		    exit(0);
+	        }
+	    }
+        }
+    }
+
+    thr = 1;
+    SelectRun();
     tv_now(&now);
 
     deltatime = (tv_delta(&now, &starttime)?:1);
@@ -1642,10 +1715,10 @@ int main(int argc, char **argv) {
 	   "Temps moyen de hit: %3.1f ms\n"
 	   "Temps moyen d'une page complete: %3.1f ms\n"
 	   "Date de demarrage: %ld (%d %s %d - %d:%02d:%02d)\n",
-	   iterations, totalhits, totalread, deltatime,
-	   totalread/(unsigned long long)deltatime, (unsigned long)((unsigned long long)totalhits*1000ULL/deltatime),
-	   totalerr, totaltout,
-           moy_htime, moy_ptime,
+	   stats[0].iterations, stats[0].totalhits, stats[0].totalread, deltatime,
+	   stats[0].totalread/(unsigned long long)deltatime, (unsigned long)((unsigned long long)stats[0].totalhits*1000ULL/deltatime),
+	   stats[0].totalerr, stats[0].totaltout,
+           stats[0].moy_htime, stats[0].moy_ptime,
 	   (long)launch_time,
            tm->tm_mday, mois[tm->tm_mon], tm->tm_year+1900,
            tm->tm_hour, tm->tm_min, tm->tm_sec);
