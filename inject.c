@@ -70,6 +70,7 @@
 #include <signal.h>
 #include <stdarg.h>
 #include <sys/resource.h>
+#include <time.h>
 
 #ifndef TCP_NODELAY
 #define TCP_NODELAY	1
@@ -210,7 +211,8 @@ void **pool_pageobj = NULL,
     **pool_buffer = NULL,
     **pool_page = NULL,
     **pool_client = NULL,
-    **pool_str = NULL;
+    **pool_str = NULL,
+    **pool_vars = NULL;
 
 /*****  prototypes **********************************************/
 void destroyclient(struct client *client, struct client *prev);
@@ -224,6 +226,7 @@ int EventWrite(int fd);
 #define sizeof_page (sizeof(struct page))
 #define sizeof_client (sizeof(struct client))
 #define sizeof_str (128)
+#define sizeof_vars (1024)
 
 #define MEM_OPTIM
 #ifdef MEM_OPTIM
@@ -430,7 +433,7 @@ static inline struct pageobj *newobj(char methode, char *host, struct sockaddr_i
     obj->uri = uri;
     obj->host = host;
     if (vars) {
-	obj->vars = (char *)alloc_pool(str);
+	obj->vars = (char *)alloc_pool(vars);
 	strcpy(obj->vars, vars);
     }
     else
