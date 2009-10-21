@@ -710,8 +710,10 @@ static inline void put_free_port(struct local_ip *ip, u_int16_t p, int offset) {
 		put_free_port(page->client->addr, obj->local_port, thr-1);
 		obj->local_port = 0;
 		close(fd);
-		destroyclient(page->client, NULL); /* renvoie un pointeur sur le suivant */
-		return 0; /* killed client */
+		return 2;
+		/* ne pas renouveler le client, sinon on risque une récursivité ! */
+		//destroyclient(page->client, NULL); /* renvoie un pointeur sur le suivant */
+		//return 0; /* killed client */
 	    }
 	    /* else connection delayed or accepted */
 	}
