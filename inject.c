@@ -1,8 +1,12 @@
 /* 2000/11/18 : correction du SEGV.
  * 2000/11/21 : grand nettoyage de l'automate et correction de nombreux bugs.
  * 2000/11/22 : ajout des time-outs, erreurs, temps par hit et par page.
- *
- * inject7
+ * 2000/11/22 : limitation du nombre de sockets simultanées par client.
+ * 2000/11/24 : correction du bug infame lie a la limitation du nombre de FD.
+ * 2001/02/26 : ajout du "User-Agent" et du "Connection: Close". Acceptation
+ *              des cookies sans "path=/"
+ *              TODO: gérer le referer, et controler la longueur des cookies lors des remplacements.
+ * inject8
  *
  * Obs : parfois l'injecteur se bloque vers le serveur sizesrv, s'il y a peu
  *	 de clients. strace montre que c'est parce qu'un connect() n'aboutit
@@ -36,11 +40,14 @@
  */
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
+#include <ctype.h>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <netinet/tcp.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
@@ -48,6 +55,11 @@
 #include <errno.h>
 #include <signal.h>
 #include <stdarg.h>
+#include <sys/resource.h>
+
+#ifndef TCP_NODELAY
+#define TCP_NODELAY	1
+#endif
 
 #define METH_NONE	0
 #define METH_GET	1
@@ -57,24 +69,24 @@
 #define STATUS_THINK	2
 #define STATUS_ERROR	3
 
-#define BUFSIZE		4096
-#define MAXSOCK		10000
-#define MAXNBFD		(3+MAXSOCK)
+#define OBJ_STNEW	-1
+#define OBJ_STTERM	-2
 
+#define BUFSIZE		4096
+#define TRASHSIZE	4096
 
 /* show stats this every millisecond, 0 to disable */
 #define STATTIME	2000
 
-#define EV_READ 1
-#define EV_WRITE 2
-#define EV_EXCEPT 4
-
 /* sur combien de bits code-t-on la taille d'un entier (ex: 32bits -> 5) */
 #define	INTBITS		5
+
+#define	USER_AGENT	"inject8"
 
 #define MINTIME(old, new)	(((new)<0)?(old):(((old)<0||(new)<(old))?(new):(old)))
 #define SETNOW(a)		(*a=now)
 
+/* un objet dont le fd est -1 est inactif */
 struct pageobj {
     struct pageobj *next;
     struct page *page;
@@ -92,8 +104,10 @@ struct pageobj {
 struct page {
     struct page *next;
     struct pageobj *objects;
+    struct pageobj *objecttostart;
     struct client *client;
-    struct timeval begin, end;
+    struct timeval begin;
+    int actobj;
     int objleft;
     int thinktime;
     int status;
@@ -104,8 +118,8 @@ struct client {
     struct client *next;
     struct timeval nextevent;
     struct timeval expire;
-    struct page *pages;
     struct page *current;
+    struct scnpage *pages;
     char *username;
     char *password;
     char *cookie;
@@ -135,43 +149,102 @@ struct scnobj  *curscnobj = NULL;
 char curscnhost[64]="host not set !";
 
 struct client *clients = NULL;
-unsigned long int reqclients=0;
+
+
+unsigned long int arg_nbclients=0;
 unsigned long int nbclients=0;
-unsigned long int nbiterations, iterations=0;
-int injectdelay = 500;
+unsigned int arg_maxobj = 8;
+unsigned long int arg_maxiter=0;
+int arg_slowstart = 0;
+int arg_maxsock = 1000;
+char *arg_scnfile = NULL;
+int arg_random_delay = 0;
+static int arg_timeout = 0;
+static int arg_log = 0;
+static int arg_maxtime = 0;
+
 static struct timeval now={0,0};
+static int one = 1;
 int nbconn=0;
 int clientid=0;
 int nbactcli=0;
+
 unsigned long long int totalread=0;
 unsigned long int totalhits=0;
 unsigned long int totalerr=0;
 unsigned long int totaltout=0;
+unsigned long int iterations=0;
 unsigned long int stat_htime=0, stat_hits=0;
 unsigned long int stat_ptime=0, stat_pages=0;
 float moy_htime = 0.0, moy_ptime = 0.0;
 
-char trash[16384];
-char *scnfile = NULL;
+char trash[TRASHSIZE];
 static struct timeval starttime = {0,0};
 static struct timeval stoptime = {0,0};
+
 int maxfd = 0;
 int stopnow = 0;
+static struct pageobj **fdtab;
 
-static int timeout = 0;
-static int benchtime = 0;
+fd_set	*ReadEvent,
+	*WriteEvent,
+	*StaticReadEvent,
+    	*StaticWriteEvent;
 
-static struct pageobj *fdtab[MAXNBFD];
-
-fd_set ReadEvent[(MAXNBFD + FD_SETSIZE - 1) / FD_SETSIZE],
-    WriteEvent[(MAXNBFD + FD_SETSIZE - 1) / FD_SETSIZE];
-
-fd_set StaticReadEvent[(MAXNBFD + FD_SETSIZE - 1) / FD_SETSIZE],
-    StaticWriteEvent[(MAXNBFD + FD_SETSIZE - 1) / FD_SETSIZE];
+void **pool_pageobj = NULL,
+    **pool_buffer = NULL,
+    **pool_page = NULL,
+    **pool_client = NULL,
+    **pool_str = NULL;
 
 /*****  prototypes **********************************************/
-void destroyclient(struct client *client);
+void destroyclient(struct client *client, struct client *prev);
+int EventRead(int fd);
+int EventWrite(int fd);
 /****************************************************/
+
+/****** gestion mémoire *******/
+#define sizeof_pageobj (sizeof(struct pageobj))
+#define sizeof_buffer (BUFSIZE)
+#define sizeof_page (sizeof(struct page))
+#define sizeof_client (sizeof(struct client))
+#define sizeof_str (128)
+
+#define MEM_OPTIM
+#ifdef MEM_OPTIM
+/*
+   Returns a pointer to type <type> taken from the
+   pool <pool_type> or dynamically allocated. In the
+   first case, <pool_type> is updated to point to the
+   next element in the list.
+*/
+#define alloc_pool(type) ({			\
+    void *p;					\
+    if ((p = pool_##type) == NULL)		\
+	p = malloc(sizeof_##type);		\
+    else {					\
+	pool_##type = *(void **)pool_##type;	\
+    }						\
+    p;						\
+})
+
+/*
+   Puts a memory area back to the corresponding pool.
+   Items are chained directly through a pointer that
+   is written in the beginning of the memory area, so
+   there's no need for any carrier cells. This implies
+   that each memory area is at least as big as one
+   pointer.
+*/
+#define free_pool(type, ptr) ({				\
+    *(void **)ptr = (void *)pool_##type;		\
+    pool_##type = (void *)ptr;				\
+})
+
+#else
+#define alloc_pool(type) (calloc(1,sizeof_##type));
+#define free_pool(type, ptr) (free(ptr));
+#endif
 
 /***************** libtools ************************/
 
@@ -231,6 +304,20 @@ static inline int tv_cmp(struct timeval *tv1, struct timeval *tv2) {
   else return 0;
 }
 
+/*
+ * compares <tv1> and <tv2> modulo 1ms: returns 0 if equal, -1 if tv1 < tv2, 1 if tv1 > tv2
+ */
+static inline int tv_cmp_ms(struct timeval *tv1, struct timeval *tv2) {
+    if ((tv1->tv_sec > tv2->tv_sec + 1) ||
+	((tv1->tv_sec == tv2->tv_sec + 1) && (tv1->tv_usec + 1000000 >= tv2->tv_usec + 1000)))
+	return 1;
+    else if ((tv2->tv_sec > tv1->tv_sec + 1) ||
+	     ((tv2->tv_sec == tv1->tv_sec + 1) && (tv2->tv_usec + 1000000 >= tv1->tv_usec + 1000)))
+	return -1;
+    else
+	return 0;
+}
+
 /* returns the absolute difference, in ms, between tv1 and tv2 */
 unsigned long tv_delta(struct timeval *tv1, struct timeval *tv2) {
   int cmp;
@@ -256,12 +343,12 @@ unsigned long tv_delta(struct timeval *tv1, struct timeval *tv2) {
 /* returns the remaining time between tv1=now and event=tv2
    if tv2 is passed, 0 is returned.
 */
-unsigned long tv_remain(struct timeval *tv1, struct timeval *tv2) {
+static inline unsigned long tv_remain(struct timeval *tv1, struct timeval *tv2) {
   int cmp;
   unsigned long ret;
   
 
-  cmp=tv_cmp(tv1, tv2);
+  cmp=tv_cmp_ms(tv1, tv2);
   if (cmp >= 0)
     return 0; /* event elapsed */
 
@@ -313,20 +400,26 @@ struct sockaddr_in *str2sa(char *str) {
    page    = page web de rattachement
    Toutes les chaines sont réallouées dynamiquement (strdup).
 */   
-struct pageobj *newobj(char methode, char *host, struct sockaddr_in *addr, char *uri, char *vars, struct page *page) {
+static inline struct pageobj *newobj(char methode, char *host, struct sockaddr_in *addr, char *uri, char *vars, struct page *page) {
     struct pageobj *obj;
 
-    obj=(struct pageobj *)calloc(1, sizeof(struct pageobj));
+    //    obj=(struct pageobj *)calloc(1, sizeof(struct pageobj));
+    obj = alloc_pool(pageobj);
+    //    memset(obj, 0, sizeof_pageobj);
+
+    memset(&obj->starttime, 0, sizeof(struct timeval));
     memcpy(&obj->addr, addr, sizeof(obj->addr));
-    obj->fd	= -1;  /* fd non ouvert */
+    obj->fd	= OBJ_STNEW;  /* fd non ouvert */
     obj->meth	= methode;
-    obj->uri	= strdup(uri);
-    obj->host	= strdup(host);
-    if (vars != NULL)
-	obj->vars	= strdup(vars);
+
+    obj->uri = uri;
+    obj->host = host;
+    obj->vars = vars;
+
     obj->next	= NULL;
     obj->page	= page;
-    obj->read = obj->buf = (char *)malloc(BUFSIZE);
+    //    obj->read = obj->buf = (char *)malloc(BUFSIZE);
+    obj->read = obj->buf = (char *)alloc_pool(buffer);
 
     return obj;
 }
@@ -338,9 +431,13 @@ struct page *newpage(struct scnpage *scn, struct client *client) {
     struct scnobj *scnobj;
     char variables[256];
 
-    page=(struct page *)calloc(1, sizeof(struct page));
+    //    page=(struct page *)calloc(1, sizeof(struct page));
+    page=(struct page *)alloc_pool(page);
+    memset(page, 0, sizeof_page);
     page->client = client;
     page->thinktime = scn->thinktime;
+    if (arg_random_delay)
+	page->thinktime += random() % (1+scn->thinktime/10) - scn->thinktime/20;
 
     obj = &(page->objects);
 
@@ -355,150 +452,212 @@ struct page *newpage(struct scnpage *scn, struct client *client) {
 
 	obj=&((*obj)->next);
     }
+    page->objecttostart = page->objects;
+
     return page;
+}
+
+/* tente de rajouter les fetchs non initiés pour une page donnée.
+   renvoie 0 si le client a été supprimé suite à une erreur.
+   renvoie 1 si le fetch a correctement été initié, et 2 s'il a échoué (manque de ressources)
+*/
+/*static inline*/ int continue_fetch(struct page *page) {
+    struct pageobj *obj;
+
+    while ((obj = page->objecttostart) != NULL) {
+	int fd;
+	if (nbconn >= arg_maxsock ||
+	    page->actobj >= arg_maxobj) { /* on ne peut pas démarrer le fetch tout de suite */
+	    return 2;
+	}
+
+	if ((fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)) == -1) {
+	    //	    fprintf(stderr, "impossible de créer une socket, destruction du client.\n");
+	    //	    destroyclient(page->client, NULL); /* renvoie un pointeur sur le suivant */
+	    //	    return 0; /* killed client */
+	    return 2;
+	}
+	
+	if ((fcntl(fd, F_SETFL, O_NONBLOCK)==-1) ||
+	    (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (char *) &one, sizeof(one)) == -1)) {
+	    fprintf(stderr,"impossible de mettre la socket en O_NONBLOCK\n");
+	}
+	if ((connect(fd, &obj->addr, sizeof(obj->addr)) == -1) && (errno != EINPROGRESS)) {
+	    if (errno == EAGAIN) { /* plus de ports en local -> réessayer plus tard */
+		close(fd);
+		return 2;
+	    }
+	    else if (errno != EALREADY && errno != EISCONN) {
+		//		fprintf(stderr,"impossible de faire le connect() pour le fd %d, errno ) %d. destruction du client.\n",
+		//			fd, errno);
+		close(fd);
+		destroyclient(page->client, NULL); /* renvoie un pointeur sur le suivant */
+		return 0; /* killed client */
+	    }
+	    /* else connection delayed or accepted */
+	}
+	else {
+	    obj->fd = fd;
+	    nbconn++;
+	    page->actobj++;
+
+	    SETNOW(&obj->starttime);
+	    fdtab[fd]=obj;
+	    FD_SET(fd, StaticWriteEvent);
+	    
+	    if (fd+1 > maxfd)
+		maxfd = fd+1;
+	}
+	page->objecttostart = obj->next;
+    }
+    return 1; /* ok */
 }
 
 /* démarre un client. Si une erreur se produit lors du démarrage, alors
    les ressources sont libérées et le client est détruit.
+   retourne 0 si le client a été détruit.
 */
-void start_client(struct client *cli) {
+int start_client(struct client *cli) {
     struct page *page;
     struct pageobj *obj;
 
     cli->status = STATUS_RUN;
-    if (timeout > 0)
-	tv_delayfrom(&cli->expire, &now, timeout);
+    if (arg_timeout > 0)
+	tv_delayfrom(&cli->expire, &now, arg_timeout);
 
     if ((page = cli->current) == NULL) /* fin des pages pour ce client */
-	return;
+	return 1;
+
+    /* initie autant de fetches que possible pour cette page */
+    if (continue_fetch(page) == 0)
+	return 0; /* client détruit */
+
+    /* on va terminer de compter les objets pour savoir combien il en reste */
+    obj = page->objecttostart;
+    page->objleft = page->actobj;
+    while (obj != NULL) {
+	page->objleft++;
+	obj = obj->next;
+    }
+
+    SETNOW(&page->begin);
+    /* le client est (re)démarré */
+    return 1;
+}
+
+
+/* retourne 0 si le client a du être détruit. */
+int newclient(char *username, char *password) {
+    struct client *newclient;
+
+//    newclient=(struct client*)calloc(1, sizeof(struct client));
+    newclient=(struct client*)alloc_pool(client);
+	memset(newclient, 0, sizeof_client);
+//fprintf(stderr,"client calloc %p\n", newclient);
+
+    if (username != NULL)
+    	newclient->username=strdup(username);
+    if (password != NULL)
+    	newclient->password=strdup(password);
+
+    newclient->pages = firstscnpage;
+    newclient->current = newpage(newclient->pages, newclient);
+    nbactcli++;
+    newclient->next = clients;
+
+    return start_client(clients = newclient);
+}
+
+/* retourne 0 si le client a été détruit */
+static inline int onemoreclient() {
+    char uname[32];
+    sprintf(uname, "%d", clientid++);
+
+    /* on entre dans le scheduler directement à partir de ce client */
+    if (newclient(uname, uname) == 0)
+	return 0;
+
+    iterations++;
+    return 1;
+}
+
+void destroypage(struct page *page) {
+    struct pageobj *obj, *nextobj;
 
     obj=page->objects;
     while (obj) {
-	if ((obj->fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)) == -1) {
-	    fprintf(stderr, "impossible de créer une socket, destruction du client.\n");
-	    destroyclient(cli); /* renvoie un pointeur sur le suivant */
-	    return;
-	}
-	else {
-	    nbconn++;
-	}
-	
-	if (fcntl(obj->fd, F_SETFL, O_NONBLOCK)==-1) {
-	    fprintf(stderr,"impossible de mettre la socket en O_NONBLOCK\n");
-	}
-	else if ((connect(obj->fd, &obj->addr, sizeof(obj->addr)) == -1) && (errno != EINPROGRESS)) {
-	    fprintf(stderr,"impossible de faire le connect() pour %d, destruction du client.\n", obj->fd);
-	    destroyclient(cli); /* renvoie un pointeur sur le suivant */
-	    return;
-	}
-	else {
-	    SETNOW(&obj->starttime);
-	    fdtab[obj->fd]=obj;
-	    FD_SET(obj->fd, StaticWriteEvent);
-	    
-	    if (obj->fd+1 > maxfd)
-		maxfd = obj->fd+1;
-	}
-	obj=obj->next;
-	page->objleft++;
-    }
-    SETNOW(&page->begin);
-    /* le client est (re)démarré */
-}
-
-
-void newclient(char *username, char *password) {
-    struct client *newclient;
-    struct page **page;
-    struct scnpage *scn;
-
-    newclient=(struct client*)calloc(1, sizeof(struct client));
-    newclient->cookie=NULL;
-    if (username != NULL)
-	newclient->username=strdup(username);
-    if (password != NULL)
-	newclient->password=strdup(password);
-
-    page=&(newclient->pages);
-    for (scn = firstscnpage; scn != NULL; scn = scn->next) {
-	*page=newpage(scn, newclient);
-	page=&((*page)->next);
-    }
-
-    newclient->next = clients;
-    newclient->cookie = NULL;
-    newclient->current = newclient->pages;
-
-    start_client(clients = newclient);
-}
-
-/* detruit le client, libère ses fd encore ouverts, décompte le nombre de connexions
-   associées, et décrémente le nombre de clients actifs */
-void destroyclient(struct client *client) {
-    struct page *page, *nextpage;
-    struct pageobj *obj, *nextobj;
-    struct client *liste;
-
-    page=client->pages;
-    while (page) {
-	obj=page->objects;
-	while (obj) {
-	    int fd = obj->fd;
-	    nextobj=obj->next;
-	    if (fd > 0) {
-		close(fd);
-		nbconn--;
+	int fd = obj->fd;
+	nextobj = obj->next;
+	if (fd > 0) {
+	    close(fd);
+	    nbconn--;
 		fdtab[fd] = NULL;
 		FD_CLR(fd, StaticReadEvent);
 		FD_CLR(fd, StaticWriteEvent);
-
+		
 		if (maxfd == fd+1) {   /* recompute maxfd */
 		    while ((maxfd-1 >= 0) && (fdtab[maxfd-1] == NULL))
 			maxfd--;
 		}
-	    }
-	    free(obj->uri);
-	    free(obj->buf);
-	    if (obj->vars)
-		free(obj->vars);
-	    free(obj);
-	    obj=nextobj;
 	}
-	nextpage=page->next;
-	free(page);
-	page=nextpage;
+	free_pool(buffer, obj->buf);
+	free_pool(pageobj, obj);
+	obj=nextobj;
+    }
+    free_pool(page, page);
+}
+
+/* detruit le client, libère ses fd encore ouverts, décompte le nombre de connexions
+   associées, et décrémente le nombre de clients actifs */
+void destroyclient(struct client *client, struct client *prev) {
+
+    if (client->current) {
+	destroypage(client->current);
     }
 
     if (clients == client)
-	clients=clients->next;
+	clients = clients->next;
     else {
-	liste = clients;
-	while ((liste != NULL) && (liste->next != client)) {
-	    liste = liste->next;
+	if ((prev != NULL) &&
+	    (prev->next == client)) { /* si on connait le précédent dans la liste, on y va directement */
 	}
-	if (liste != NULL)
-	    liste->next = client->next;
+	else {
+	    prev = clients;
+	    while (prev->next != client) {
+		prev = prev->next;
+	    	if (prev == NULL)
+			abort(); /* ca ne doit jamais arriver */
+	    }
+	}
+	prev->next = client->next;
     }
     if (client->cookie)
 	free(client->cookie);
-    if (client->username)
-	free(client->username);
     if (client->password)
 	free(client->password);
+    if (client->username)
+	free(client->username);
+    free_pool(client, client);
 
-    free(client);
     nbactcli--;
+
+    while (nbactcli < nbclients) {
+	if (onemoreclient() == 0) {
+	    break; /* si ret==0, plus possible d'injecter à cause d'erreurs */
+	}
+    }
+
     return;
 }
 
 int stats(void *arg) {
-	static lines;
+	static int lines;
 	static struct timeval nextevt;
 	static unsigned long lasthits;
 	static unsigned long long lastread;
 	static struct timeval lastevt;
 	unsigned long totaltime, deltatime;
-	if (tv_cmp(&now, &nextevt) >= 0) {
+	if (tv_cmp_ms(&now, &nextevt) >= 0) {
 		deltatime = (tv_delta(&now, &lastevt)?:1);
 		totaltime = (tv_delta(&now, &starttime)?:1);
 
@@ -510,24 +669,40 @@ int stats(void *arg) {
 		    moy_ptime = 0.8 * moy_ptime + ((moy_ptime == 0.0) ? 1.0 : 0.2) * (float)stat_ptime/(float)stat_pages;
 
 
-		if (lines++ % 16 == 0)
+		if ((lines++ % 16 == 0) && !arg_log)
 		    fprintf(stderr,
-			    "\n   time delta clients    hits ^hits"
-			    " hits/s  ^h/s     bytes   ^bytes  kB/s"
+			    "\n   hits ^hits"
+			    " hits/s  ^h/s     bytes  kB/s"
 			    "  last  errs  tout htime ptime\n");
-
 		if (lines>1) {
-			fprintf(stderr,"%7ld %5ld %7ld %7ld %5ld  %5ld %5ld %9lld %8lld %5ld %5ld %5ld %5ld %03.1f %03.1f\n",
+		    if (arg_log)
+			fprintf(stdout,"%7ld %5ld %7ld %7ld %5ld  %5ld %5ld %9lld %8lld %5ld %5ld %5ld %5ld %03.1f %03.1f %5d\n",
 				totaltime, deltatime,
 				iterations,
 				totalhits, stat_hits/*totalhits-lasthits*/,
-				totalhits*1000/totaltime,
+				(unsigned long)((unsigned long long)totalhits*1000ULL/totaltime),
 				stat_hits/*(totalhits-lasthits)*/*1000/deltatime,
 				totalread, totalread-lastread,
 				(long)(totalread/(unsigned long long)totaltime),
 				(long)((totalread-lastread)/(unsigned long long)deltatime),
 				totalerr, totaltout,
+				moy_htime, moy_ptime, nbactcli);
+		    else
+			fprintf(stderr,"%7ld %5ld  %5ld %5ld %9lld %5ld %5ld %5ld %5ld %03.1f %03.1f\n",
+				totalhits, stat_hits/*totalhits-lasthits*/,
+				(unsigned long)((unsigned long long)totalhits*1000ULL/totaltime),
+				stat_hits/*(totalhits-lasthits)*/*1000/deltatime,
+				totalread,
+				(long)(totalread/(unsigned long long)totaltime),
+				(long)((totalread-lastread)/(unsigned long long)deltatime),
+				totalerr, totaltout,
 				moy_htime, moy_ptime);
+		}
+		else if (arg_log) {  /* print it once */
+		    fprintf(stderr,
+			    "   time delta clients    hits ^hits"
+			    " hits/s  ^h/s     bytes   ^bytes  kB/s"
+			    "  last  errs  tout htime ptime nbcli\n");
 		}
 
 		tv_delayfrom(&nextevt, &now, STATTIME);
@@ -537,45 +712,33 @@ int stats(void *arg) {
 		stat_hits = stat_htime = 0;
 		stat_pages = stat_ptime = 0;
 
-		if (benchtime > 0 && tv_cmp(&stoptime, &now) < 0)
+		if ((arg_maxtime > 0 && tv_cmp_ms(&stoptime, &now) < 0)
+		    || (arg_maxiter > 0 && iterations > arg_maxiter))
 		    stopnow=1;  /* bench must terminate now */
 	}	
 	return tv_remain(&now, &nextevt);
 }
 
-static void onemoreclient() {
-    char uname[32];
-    sprintf(uname, "%d", clientid++);
-    /* on entre dans le scheduler directement à partir de ce client */
-    newclient(uname, uname);
-    nbactcli++;
-    iterations++;
-}
-
 /* ce scheduler s'occupe d'injecter des clients tant qu'il n'y en a pas assez, mais jamais
-   plus d'un tous les <injectdelay> ms
+   plus d'un tous les <arg_slowstart> ms
 */
 static inline int injecteur(void *arg) {
     static struct timeval next;
 
-    //    if
-    while
-	(nbactcli < nbclients)
-	onemoreclient();
-
-    if ((iterations == nbiterations) /* c'est la fin, on ne veut plus injecter */
-	|| (nbconn >= MAXSOCK) /* on ne peut plus injecter par manque de sockets */
-	|| (nbclients >= reqclients)) /* il y a assez de clients */
+    if ((arg_maxiter > 0) && (iterations == arg_maxiter)) /* c'est la fin, on ne veut plus injecter */
 	return -1;
 
-    if (tv_cmp(&next, &now) > 0)  /* on ne doit pas encore créer de nouveau client */
+    /* ajoute tout ce qui manque tant qu'on peut le faire */
+    while ((nbactcli < nbclients) && (onemoreclient() != 0));
+
+    if (tv_cmp_ms(&next, &now) > 0)  /* on ne doit pas encore créer de nouveau client */
 	return tv_remain(&now, &next);
 
-    if (nbclients < reqclients)
+    if (nbclients < arg_nbclients)
 	nbclients++;
 
-    tv_delayfrom(&next, &now, injectdelay);
-    return injectdelay;
+    tv_delayfrom(&next, &now, arg_slowstart);
+    return arg_slowstart;
 }
 
 
@@ -584,83 +747,75 @@ static inline int injecteur(void *arg) {
  */
 int scheduler(void *arg) {
     static struct timeval next;
-    struct client *cli, *nextcli;
+    struct client *cli, *nextcli, *prev;
     unsigned int delay;
 
     delay = -1;
 
-    nextcli = clients;
-    while ((cli = nextcli) != NULL) {
-	struct page *page;
-	struct pageobj *obj;
-
+    nextcli = clients; prev = NULL;
+    while ((cli = nextcli) != NULL && !stopnow) {
 	nextcli = cli->next;
-
+#ifdef SANITY_CHECKS
+	if (cli->current == NULL)
+		abort();  /* ca ne doit jamais arriver ici */
+#endif
 	if (cli->status == STATUS_RUN) {
 	    unsigned int del2;
-	    if (timeout == 0)
-		continue;
 
-	    if ((del2 = tv_remain(&now, &cli->expire)) > 0) {
-		if (del2 < delay)
-		    delay = del2;
-		continue;
+	    if (arg_timeout > 0) {
+		if ((del2 = tv_remain(&now, &cli->expire)) > 0) {
+		    delay = MINTIME(del2, delay);
+		}
+		else {
+		    totaltout++;
+		    destroyclient(cli, prev);
+		    continue;
+		}
 	    }
-	    else {
-		totaltout++;
-		destroyclient(cli);
-		continue;
+	    if (cli->current->objecttostart != NULL) { /* s'il reste des fetches à effectuer, on les fait. */
+		if (continue_fetch(cli->current) == 0)
+			continue; /* le client a été détruit ? */
 	    }
+	    prev = cli; /* conserve le chainage pour accélérer la suppression */
+	    continue;
 	}
 	else if (cli->status == STATUS_THINK) {
 	    unsigned int del2;
 	    if ((del2 = tv_remain(&now, &cli->nextevent)) > 0) {  /* attendre avant de passer à la page suivante */
-		if (del2 < delay)
-		    delay = del2;
+		delay = MINTIME(del2, delay);
+		prev = cli; /* conserve le chainage pour accélérer la suppression */
 		continue;
 	    }
 	    else {
-		page = cli->current = cli->current->next;
-		if (page == NULL) {  /* fin du scénario pour ce client */
-		    totalread += cli->dataread;
+#ifndef PER_CLIENT_STATS
+		//		totalread += cli->current->dataread;
+#endif
+		if ((cli->pages = cli->pages->next) == NULL) { /* fin du scénario pour ce client */
+#ifdef PER_CLIENT_STATS
+		    //		    totalread += cli->dataread;
 		    totalhits += cli->hits;
-		    destroyclient(cli);
+#endif
+		    destroyclient(cli, prev);
 		    continue;
 		}
 		else {
-		    start_client(cli);
+		    destroypage(cli->current);
+		    cli->current = newpage(cli->pages, cli);
+
+		    if (start_client(cli) != 0)
+			prev = cli; /* conserve le chainage pour accélérer la suppression */
 		    continue;
 		}
 	    }
 	}
-	else if ((cli->status == STATUS_ERROR) && (cli->current->objleft == 0)) {
+	else if ((cli->status == STATUS_ERROR) /*&& (cli->current->actobj == 0)*/) {
 	    totalerr++;
-	    destroyclient(cli);
+	    destroyclient(cli, prev);
 	    continue;
 	}
+	prev = cli; /* conserve le chainage pour accélérer la suppression */
     }
     
-    if
-	//    while
-	(nbactcli < nbclients) {
-	onemoreclient();
-    }
-
-#if 0 /* can never be called because of the statement just above */
-    if ((nbactcli == 0) && (iterations == nbiterations)) {
-	int deltatime = (tv_delta(&now, &starttime)?:1);
-	printf("\nFin.\nClients : %ld\nHits    : %ld\nOctets  : %lld\nDuree   : %ld ms\n"
-	       "Debit   : %lld kB/s\nReponse : %ld hits/s\n"
-	       "Erreurs : %ld\nTimeouts: %ld\n"
-	       "Temps moyen de hit: %3.1f ms\n"
-	       "Temps moyen d'une page complete: %3.1f ms\n",
-	       iterations, totalhits, totalread, deltatime,
-	       totalread/(unsigned long long)deltatime, totalhits*1000/deltatime,
-	       totalerr, totaltout, moy_htime, moy_ptime);
-	exit(0);
-    }
-#endif
-
     tv_delayfrom(&next, &now, delay);
 
 #if 0
@@ -674,7 +829,7 @@ int scheduler(void *arg) {
     return delay;
 }
 
-int SelectRun() {
+void SelectRun() {
   int next_time, time2;
   int status;
   int fd,i;
@@ -685,8 +840,10 @@ int SelectRun() {
       next_time = -1;
       tv_now(&now);
 
-      time2 = injecteur(NULL);
-      next_time = MINTIME(time2, next_time);
+      if (nbactcli < arg_nbclients) { /* ne pas y aller si ce n'est pas nécessaire */
+	  time2 = injecteur(NULL);
+	  next_time = MINTIME(time2, next_time);
+      }
 	  
       time2 = scheduler(NULL);
       next_time = MINTIME(time2, next_time);
@@ -704,15 +861,19 @@ int SelectRun() {
 
 
     /* on restitue l'etat des fdset */
-      //      memcpy(ReadEvent, StaticReadEvent, sizeof(ReadEvent));
-      //      memcpy(WriteEvent, StaticWriteEvent, sizeof(WriteEvent));
 
+#define FDSET_OPTIM
+#ifndef FDSET_OPTIM
+	memcpy(ReadEvent, StaticReadEvent, sizeof(ReadEvent));
+	memcpy(WriteEvent, StaticWriteEvent, sizeof(WriteEvent));
+      readnotnull = 1; writenotnull = 1;
+#else
       readnotnull = 0; writenotnull = 0;
-      for (i = 0; i < sizeof(ReadEvent)/sizeof(int); i++) {
+      for (i = 0; i < (arg_maxsock + 3 + FD_SETSIZE - 1)/(8*sizeof(int)); i++) {
 	  readnotnull |= (*((int*)ReadEvent+i) = *((int*)StaticReadEvent+i)) != 0;
 	  writenotnull |= (*((int*)WriteEvent+i) = *((int*)StaticWriteEvent+i)) != 0;
       }
-      
+#endif
       /* On va appeler le select(). Si le temps fixé est nul, on considère que
 	 c'est un temps infini donc on passe NULL à select() au lieu de {0,0}.  */
       status=select(maxfd,
@@ -747,9 +908,10 @@ int SelectRun() {
 			  close(fd);
 			  nbconn--;
 			  fdtab[fd]->page->objleft--;
+			  fdtab[fd]->page->actobj--;
 			  FD_CLR(fd, StaticReadEvent);
 			  FD_CLR(fd, StaticWriteEvent);
-			  fdtab[fd]->fd = 0;
+			  fdtab[fd]->fd = OBJ_STTERM;
 			  fdtab[fd]=NULL;
 			  
 			  if (maxfd == fd+1) {   /* recompute maxfd */
@@ -885,7 +1047,6 @@ int parsescnline(char *line) {
 
 /*** retourne 0 si OK, 1 si on doit fermer le FD ***/
 int EventWrite(int fd) {
-    int ret;
     char req[2048];
     char *r = req;
     struct pageobj *obj;
@@ -893,8 +1054,8 @@ int EventWrite(int fd) {
 
     obj = fdtab[fd];
 
-    if (timeout > 0)
-	tv_delayfrom(&obj->page->client->expire, &now, timeout);
+    if (arg_timeout > 0)
+	tv_delayfrom(&obj->page->client->expire, &now, arg_timeout);
 
     ldata=sizeof(data);
     getsockopt(fd, SOL_SOCKET, SO_ERROR, &data, &ldata);
@@ -909,10 +1070,17 @@ int EventWrite(int fd) {
 	    if (obj->page->client->cookie)
 		r+=sprintf(r, "Cookie: %s\r\n", obj->page->client->cookie);
 	    r+=sprintf(r, "Host: %s\r\n", obj->host);
+	    r+=sprintf(r, "User-Agent: " USER_AGENT "\r\n");
+	    r+=sprintf(r, "Connection: Close\r\n");
 	    r+=sprintf(r,"\r\n");
 	}
 	else { /* meth = METH_POST */
 	    r+=sprintf(r, "POST %s HTTP/1.0\r\n", obj->uri);
+	    r+=sprintf(r, "Host: %s\r\n", obj->host);
+	    r+=sprintf(r, "User-Agent: " USER_AGENT "\r\n");
+	    r+=sprintf(r, "Connection: Close\r\n");
+	    r+=sprintf(r, "Content-Type: application/x-www-form-urlencoded\r\n");
+
 	    if (obj->page->client->cookie)
 		r+=sprintf(r, "Cookie: %s\r\n", obj->page->client->cookie);
 	    if (obj->vars) {		
@@ -933,8 +1101,8 @@ int EventWrite(int fd) {
 	}
 	else {
 	    if (errno != EAGAIN) {
-		fprintf(stderr,"[Event] erreur sur le write().\n");
-		/*tv_now*/SETNOW(&obj->page->end);
+		//		fprintf(stderr,"[Event] erreur sur le write().\n");
+		//		/*tv_now*/SETNOW(&obj->page->end);
 		obj->page->client->status = obj->page->status = STATUS_ERROR;
 		return 1;
 	    }
@@ -942,8 +1110,8 @@ int EventWrite(int fd) {
 	}
     }
     else { /* erreur sur la socket */
-	fprintf(stderr,"[Event] erreur sur le connect() : %d\n",data);
-	/*tv_now*/SETNOW(&obj->page->end);
+	//	fprintf(stderr,"[Event] erreur sur le connect() : %d\n",data);
+	//	/*tv_now*/SETNOW(&obj->page->end);
 	obj->page->client->status = obj->page->status = STATUS_ERROR;
 	return 1;
     }
@@ -954,14 +1122,12 @@ int EventWrite(int fd) {
 /*** retourne 0 si OK, 1 si on doit fermer le FD ***/
 int EventRead(int fd) {
     int ret, moretoread;
-    char req[2048];
-    char *r = req;
     struct pageobj *obj;
 
     obj = fdtab[fd];
 
-    if (timeout > 0)
-	tv_delayfrom(&obj->page->client->expire, &now, timeout);
+    if (arg_timeout > 0)
+	tv_delayfrom(&obj->page->client->expire, &now, arg_timeout);
 
     do {
 	moretoread = 0;
@@ -970,7 +1136,7 @@ int EventRead(int fd) {
 	else {
 	    ret=read(fd, obj->read, BUFSIZE - (obj->read - obj->buf)); /* lire et stocker les data */
 	    if (ret > 0)
-		obj->read+=ret;
+		obj->read += ret;
 	}
 
 	if (ret>0) {
@@ -979,6 +1145,7 @@ int EventRead(int fd) {
 
 	    obj->page->dataread+=ret;
 	    obj->page->client->dataread+=ret;
+	    totalread += ret;
 
 	    moretoread = 1;
 	}
@@ -990,6 +1157,8 @@ int EventRead(int fd) {
 	    stat_htime += tv_delta(&obj->starttime, &now);
 	    stat_hits ++;
 
+#ifndef DONT_ANALYSE_HTTP_HEADERS
+
 	    /* lire les headers pour savoir s'il y a un cookie */
 	    ptr1 = obj->buf;
 	    while (ptr1 < obj->read) {
@@ -1000,7 +1169,7 @@ int EventRead(int fd) {
 		ptr2 = ptr1;
 
 		/* recherche la fin de la chaine */
-		while ((ptr1<obj->read) && (*ptr1 != '\n') && (*ptr1 != '\r'))
+		while ((ptr1 < obj->read) && (*ptr1 != '\n') && (*ptr1 != '\r'))
 		    ptr1++;
 		/* ptr1 pointe sur le premier saut de ligne ou retour charriot */
 
@@ -1012,39 +1181,112 @@ int EventRead(int fd) {
 #endif
 
 		if ((ptr1-ptr2 > 11) && !strncasecmp(ptr2,"Set-Cookie:",11)) {
+
+		    /* recherche du début de la partie utile du cookie */
 		    ptr2+=11;
-		    while ((ptr2<ptr1) && isspace(*ptr2))
+		    while ((ptr2 < ptr1) && isspace(*ptr2))
 			ptr2++;
-		    /* on va se débarrasser des lignes ne contenant pas "path=" */
-		    if (((ptr3=strstr(ptr2,"path=")) != NULL) && (ptr3<ptr1)) {
+
+		    /* on va se débarrasser des "path=" */
+		    //		    *ptr1=0;
+
+		    ptr3 = ptr2;
+		    while ((ptr3 <= ptr1-5) && (strncmp(ptr3, "path=", 5) != 0))
+			ptr3++;
+
+		    //		    if (((ptr3=strstr(ptr2,"path=")) != NULL)) {
+		    if (ptr3 <= ptr1-5) {
 			/* et on se débarrasse aussi de "; path=" */
-			while ((ptr3 > ptr2) && ((*(ptr3-1)==' ') || (*(ptr3-1)==';')))
+			while ((ptr3 > ptr2) && ((*(ptr3-1)==' ') || (*(ptr3-1)==';') || (*(ptr3-1)=='\t')))
 			    ptr3--;
-
-			/* le cookie est compris entre ptr2 et ptr3 */
-			/* on va le concaténer au cookie existant */
-			if (obj->page->client->cookie != NULL) {
-			    cookie=(char *)calloc(1, strlen(obj->page->client->cookie) + ptr3-ptr2 + 3);
-			    strcpy(cookie, obj->page->client->cookie);
-			    strcat(cookie,"; ");
-			    strncat(cookie, ptr2, ptr3-ptr2);
-			    /* on a forcément le zéro final */
-			    free(obj->page->client->cookie);
-			    obj->page->client->cookie=cookie;
-			    // Log(LOG_LDEBUG,"[Event] Cookie = %s\n", cookie);
-			}
-			else {
-			    cookie=(char *)calloc(1, ptr3-ptr2+1);
-			    strncpy(cookie, ptr2, ptr3-ptr2);
-			    /* on a forcément le zéro final */
-			    obj->page->client->cookie=cookie;
-			    // Log(LOG_LDEBUG,"[Event] Cookie = %s\n", cookie);
-			}
+		    } else {
+			ptr3=ptr2;
+			while (ptr3 < ptr1 && *ptr3 && *ptr3 != '\n' && *ptr3 != '\r'
+			       && *ptr3 != ' ' && *ptr3 != '\t' && *ptr3 != ';')
+				ptr3++;
 		    }
-		}
 
+		    /* on ne devrait pas faire ceci car on écrase peut-etre un CR ou un LF */
+		    //		    *ptr3=0;
+
+
+		    /* a ce niveau, le nouveau cookie est compris exactement entre ptr2 et ptr3
+		     * sous la forme var=val sans délimiteur. ptr2 est terminé par un zero.
+		     */
+		    //		    fprintf(stderr,"---ptr2-ptr3=<%s>\n", ptr2);
+
+		    /* le cookie est compris entre ptr2 et ptr3 */
+		    /* on va le concaténer au cookie existant */
+		    if (obj->page->client->cookie != NULL) {
+			char *equal, *oldcookie = obj->page->client->cookie;
+			char *newcookie, *end;
+			newcookie = cookie = (char *)calloc(1, strlen(oldcookie) + ptr3-ptr2 + 6);
+
+			/* si les cookies actuels contiennent le meme cookie, il faut le remplacer */
+			equal = ptr2;
+
+			/* a remplacer par un strstr */
+			while ((equal < ptr3) && *equal && (*equal != '='))
+			    equal++;
+			
+			/* le nom du cookie est maintenant compris entre ptr2 et ptr3 */
+
+			//			strncpy(newcookie, ptr2, ptr3-ptr2);
+			//			*(newcookie+=(ptr3-ptr2)) = 0;
+			//			strcpy(newcookie, "; "); newcookie += 2;
+
+
+			//			fprintf(stderr,"ptr2=<%s>, oldcookie=<%s>\n", ptr2, oldcookie);
+
+
+			//			if ((equal < ptr3) && (*equal == '='))
+			{
+			    while (*oldcookie) {
+				end = oldcookie;
+
+				/* cherche la fin du premier cookie */
+				while (*end && (*end != ' ') && (*end != ';'))
+				    end++;
+
+				//				fprintf(stderr,"ptr2=%s, oldcookie=%s\n", ptr2, oldcookie);
+
+				/* tous les cookies differents sont recopies */
+				if (strncmp(oldcookie, ptr2, equal-ptr2+1) != 0) {  /* copier ce cookie */
+				    //				    fprintf(stderr,"recopie: %s\n", oldcookie);
+				    memcpy(newcookie, oldcookie, end-oldcookie);
+				    newcookie += (end-oldcookie);
+				    strcpy(newcookie, "; "); newcookie += 2;
+				}
+
+				/* passer au cookie suivant */
+				oldcookie = end;
+				while (*oldcookie && (*oldcookie == ' ' || *oldcookie == ';'))
+				    oldcookie++;
+			    }
+			    
+			    //				    strcpy(cookie, obj->page->client->cookie);
+			    //				    strcat(cookie,"; ");
+			    //				    strncat(cookie, ptr2, ptr3-ptr2);
+			    memcpy(newcookie, ptr2, ptr3-ptr2);
+			    newcookie+=(ptr3-ptr2);
+			    strcpy(newcookie, "; "); newcookie += 2;
+			}
+			free(obj->page->client->cookie);
+			obj->page->client->cookie = cookie; /* affectation du nouveau cookie */
+			// Log(LOG_LDEBUG,"[Event] Cookie = %s\n", cookie);
+		    }
+		    else {
+			cookie=(char *)calloc(1, ptr3-ptr2+1);
+			memcpy(cookie, ptr2, ptr3-ptr2);
+			cookie[ptr3-ptr2]=0;
+			obj->page->client->cookie=cookie;
+			// Log(LOG_LDEBUG,"[Event] Cookie = %s\n", cookie);
+		    }
+		    //		    fprintf(stderr,"---cookie=<%s>\n", cookie);
+		}
+		
 		/* recherche la fin du saut de ligne */
-		if (ptr1<obj->read) {
+		if (ptr1 < obj->read) {
 		    if (ptr1+1 < obj->read) {
 			if ((*ptr1 == '\n') && (ptr1[1] == '\r'))
 			    ptr1++;
@@ -1054,11 +1296,16 @@ int EventRead(int fd) {
 		    ptr1++;
 		}
 	    }
+#endif
+
+#ifndef PER_CLIENT_STATS
+	    totalhits ++;
+#endif
 
 	    if (obj->page->objleft == 1) {  /* dernier objet de cette page */
 		// Log(LOG_LDEBUG,"[Event] dernier objet de la page, mise en veille du client.\n");
 		obj->page->client->hits++;
-		/*tv_now*/SETNOW(&obj->page->end);
+		//		/*tv_now*/SETNOW(&obj->page->end);
 		tv_delayfrom(&obj->page->client->nextevent, &now, obj->page->thinktime);
 		if (obj->page->client->status != STATUS_ERROR) {
 		    obj->page->client->status = obj->page->status = STATUS_THINK;
@@ -1105,52 +1352,115 @@ void sighandler(int sig) {
     return;
 }
 
+void usage() {
+    fprintf(stderr,
+	    "Syntaxe : inject -u <users> -f <scnfile> [ -i <iter> ] [ -d <duration> ] [ -l ]\n"
+	    "          [ -r ] [ -t <timeout> ] [ -n <maxsock> ] [ -o <maxobj> ]\n"
+	    "          [ -s <starttime> ]\n"
+	    "- users    : nombre de clients simultanes (=nb d'instances du scenario)\n"
+	    "- iter     : nombre maximal d'iterations a effectuer par client\n"
+	    "- starttime: temps (en ms) d'incrementation du nb de clients (montee en charge)\n"
+	    "- scnfile  : nom du fichier de scénario a utiliser\n"
+	    "- timeout  : timeout (en ms) sur un objet avant destruction du client\n"
+	    "- duration : duree maximale du test (en secondes)\n"
+	    "- maxobj   : nombre maximal d'objets en cours de lecture par client\n"
+	    "- maxsock  : nombre maximal de sockets utilisees\n"
+	    "- [ -r ]   : ajoute 10%% de random sur le thinktime\n"
+	    "- [ -l ]   : passe en format de logs (plus large, pas de repetition de legende)\n"
+	    "Le fichier de scenario a pour syntaxe :\n"
+	    "host addr:port\n"
+	    "new pageXXX <think time en ms>\n"
+	    "\tget . /fichier1.html\n"
+	    "\tget . /fichier2.html\n"
+	    "new pageYYY <think time ...>\n");
+    exit(1);
+}
+
 int main(int argc, char **argv) {
-    int deltatime;
+    struct rlimit rlim;
+    long int deltatime;
 
     if (1<<INTBITS != sizeof(int)*8) {
 	fprintf(stderr,"Erreur: recompiler avec pour que sizeof(int)=%d\n",sizeof(int)*8);
 	exit(1);
     }
-    if (argc < 5) {
-	fprintf(stderr,"Syntaxe : inject <users> <iter> <injdly> <scn> [<tout> [<stop>]]\n"
-		"- users : nombre de clients simultanes (=nb d'instances du scenario).\n"
-		"- iter  : nombre maximal d'iterations a effectuer par client.\n"
-		"- injdly: temps (en ms) d'incrementation du nb de clients (montee en charge).\n"
-		"- scn   : nom du fichier de scénario a utiliser.\n"
-		"- tout  : timeout (en ms) sur un objet avant destruction du client.\n"
-		"- stop  : duree maximale du test (en secondes).\n"
-		"Le fichier de scenario a pour syntaxe :\n"
-		"host addr:port\n"
-		"new pageXXX <think time en ms>\n"
-		"\tget . /fichier1.html\n"
-		"\tget . /fichier2.html\n"
-		"new pageYYY <think time ...>\n");
+
+    argc--; argv++;
+    while (argc > 0) {
+	char *flag;
+
+	if (**argv == '-') {
+	    flag = *argv+1;
+
+	    /* 1 arg */
+	    if (*flag == 'l')
+		arg_log = 1;
+	    else if (*flag == 'r')
+		arg_random_delay = 1;
+	    else { /* 2+ args */
+		argv++; argc--;
+		if (argc == 0)
+		    usage();
+
+		switch (*flag) {
+		case 't' : arg_timeout = atol(*argv); break;
+		case 'u' : arg_nbclients = atol(*argv); break;
+		case 'i' : arg_maxiter = atol(*argv); break;
+		case 'd' : arg_maxtime = atol(*argv); break;
+		case 'f' : arg_scnfile = *argv; break;
+		case 'n' : arg_maxsock = atol(*argv); break;
+		case 'o' : arg_maxobj = atol(*argv); break;
+		case 's' : arg_slowstart = atol(*argv); break;
+		default: usage();
+		}
+	    }
+	}
+	else
+	    usage();
+	    argv++; argc--;
+    }
+    nbclients = 0;
+    arg_maxiter *= arg_nbclients;
+
+    if (!arg_scnfile ||	!arg_nbclients)
+	usage();
+
+    if (geteuid() == 0) {
+	rlim.rlim_cur = rlim.rlim_max = arg_maxsock + 3;
+	if (setrlimit(RLIMIT_NOFILE, &rlim) == -1)
+	    fprintf(stderr,"Warning: cannot set RLIMIT_NOFILE to %d\n", arg_maxsock+3);
+    }
+    if (getrlimit(RLIMIT_NOFILE, &rlim) == 0) {
+	if (rlim.rlim_max < arg_maxsock + 3)
+	    fprintf(stderr,"Warning: system will not allocate more than %ld sockets\n", rlim.rlim_max);
+    }
+    else
+	fprintf(stderr,"Warning: cannot verify if system will accept %d sockets\n", arg_maxsock+3);
+
+    if (readscnfile(arg_scnfile) < 0) {
+	fprintf(stderr, "[inject] Error reading scn file : %s\n", arg_scnfile);
 	exit(1);
     }
-    reqclients = atol(argv[1]);
-    nbclients = 1;
-    nbiterations = atol(argv[2]) * reqclients;
-    injectdelay = atol(argv[3]);
-    scnfile = argv[4];
-    if (argc > 5)
-	timeout = atol(argv[5]);
-    if (argc > 6)
-	benchtime = atol(argv[6]);
 
-    if (readscnfile(scnfile) < 0) {
-	fprintf(stderr, "[inject] Error reading scn file : %s\n", scnfile);
-	exit(1);
-    }
-
-    FD_ZERO(StaticReadEvent);
-    FD_ZERO(StaticWriteEvent);
-    bzero(fdtab, sizeof(fdtab));
+    ReadEvent = (fd_set *)calloc(1,
+		sizeof(fd_set) *
+		(arg_maxsock + 3 + FD_SETSIZE - 1) / FD_SETSIZE);
+    WriteEvent = (fd_set *)calloc(1,
+		sizeof(fd_set) *
+		(arg_maxsock + 3 + FD_SETSIZE - 1) / FD_SETSIZE);
+    StaticReadEvent = (fd_set *)calloc(1,
+		sizeof(fd_set) *
+		(arg_maxsock + 3 + FD_SETSIZE - 1) / FD_SETSIZE);
+    StaticWriteEvent = (fd_set *)calloc(1,
+		sizeof(fd_set) *
+		(arg_maxsock + 3 + FD_SETSIZE - 1) / FD_SETSIZE);
+    fdtab = (struct pageobj **)calloc(1,
+		sizeof(struct pageobj *) * (arg_maxsock + 3));
 
     signal(SIGINT, sighandler);
 
     tv_now(&now);
-    tv_delayfrom(&stoptime, &now, benchtime * 1000);
+    tv_delayfrom(&stoptime, &now, arg_maxtime * 1000);
 
     SelectRun();
 
