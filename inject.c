@@ -29,6 +29,7 @@
  * 2005/01/19 : Ne plus démarrer un client si pas assez de FD.
  *		Synthèse des statistiques avant affichage final.
  * 2005/08/09 : ajout des options -H, -T, -G, -P pour faire le scénario en ligne de commande.
+ * 2005/10/09 : correction du nom 'host' si utilisation de -G.
  *
  * Remarque : le champ "variables" HTTP peut contenir 2 "%s" qui seront remplacés par l'id du client
  *            et son mot de passe (=id)
@@ -275,8 +276,8 @@ int EventWrite(int fd);
 #define sizeof_buffer (BUFSIZE)
 #define sizeof_page (sizeof(struct page))
 #define sizeof_client (sizeof(struct client))
-#define sizeof_str (128)
-#define sizeof_vars (1024)
+#define sizeof_str (512)
+#define sizeof_vars (512)
 
 #define MEM_OPTIM
 #ifdef MEM_OPTIM
@@ -1331,7 +1332,8 @@ int parsescnline(char *line) {
 
     if (!strcasecmp(*args, "host")) {  /* host */
 	if (isalnum(*args[1])) {
-	    strncpy(curscnhost, args[1], sizeof(curscnhost));
+	    strncpy(curscnhost, args[1], sizeof(curscnhost) - 1);
+	    curscnhost[sizeof(curscnhost)-1] = 0;
 	}
 	return 0;
     }
@@ -1931,6 +1933,7 @@ int main(int argc, char **argv) {
 	int nbpages = arg_nbpages;
 	char curhost[256];
 	char *uri, *args;
+	int urilen;
 
 	if (!nbpages)
 	    nbpages = 10;
@@ -1940,7 +1943,11 @@ int main(int argc, char **argv) {
 	if (uri == NULL)
 	    uri = arg_geturl + strlen(arg_geturl);
 
-	strncpy(curhost, arg_geturl, uri - arg_geturl);
+	urilen = uri - arg_geturl;
+	if (urilen > sizeof(curhost) - 1)
+	    urilen = sizeof(curhost) - 1;
+	memcpy(curhost, arg_geturl, urilen);
+	curhost[urilen] = 0;
 
 	/* support host:port without trailing '/' */
 	if (!*uri)
@@ -1957,12 +1964,17 @@ int main(int argc, char **argv) {
 
 	    for (curobj = 0; curobj < arg_maxobj; curobj++)
 		newscnobj(METH_GET, curhost, uri, args);
+
+	    //fprintf(stderr, "curhost=%s, uri=%s, args=%s.\n", curhost, uri, args);
+
 	}
     }
     else if (readscnfile(arg_scnfile) < 0) {
 	fprintf(stderr, "[inject] Error reading scn file : %s\n", arg_scnfile);
 	exit(1);
     }
+
+    fprintf(stderr, "Fin de lecture du scénario.\n");
 
     ReadEvent = (fd_set *)calloc(1,
 		sizeof(fd_set) *
