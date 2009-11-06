@@ -2,6 +2,11 @@
  * Injecteur HTTP simple (C) 2000-2009 Willy Tarreau <willy@ant-computing.com>
  * Utilisation et redistribution soumises a la licence GPL.
  *
+ * Compilation :
+ *    gcc -O2 -o inject inject.c -lm          # par défaut
+ *    gcc -O2 -DNO_SD -o inject inject.c      # désactive sdht (pas besoin de libm)
+ *    gcc -O2 -DDONT_ANALYSE_HTTP_HEADERS -o inject inject.c -lm  # désactive parseur HTTP
+ *
  * 2000/11/18 : correction du SEGV.
  * 2000/11/21 : grand nettoyage de l'automate et correction de nombreux bugs.
  * 2000/11/22 : ajout des time-outs, erreurs, temps par hit et par page.
@@ -977,6 +982,7 @@ int show_stats(void *arg) {
 	    /*
 	     * standard deviation = sqrt(sum(x-moy)^2/n) = sqrt((sum(x^2)-2*moy*sum(x))/n + moy^2)
 	     */
+#ifndef NO_SD
 	    if (stats[0].stat_hits) {
 		double nb1;
 		stats[0].moy_htime = stats[0].tot_htime / (double)stats[0].stat_hits;
@@ -988,6 +994,7 @@ int show_stats(void *arg) {
 		stats[0].moy_sdhtime = sqrt(nb1);
 	    }
 	    else
+#endif
 		stats[0].moy_sdhtime = stats[0].moy_htime = stats[0].moy_ptime = 0;
 	    
 	    if (stats[0].stat_pages)
