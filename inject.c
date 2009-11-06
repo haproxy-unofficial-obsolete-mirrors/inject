@@ -1596,17 +1596,15 @@ int EventWrite(int fd) {
 	else
 	    data = send(fd, req, r-req, MSG_DONTWAIT);
     }
-#else
-#ifdef TCP_CORK
+#elif MSG_MORE
     /* If we force binding to a local port, we have SO_REUSEADDR set,
      * so we're not annoyed with local TIME_WAIT sockets. Thus, we can
      * send a fast shutdown, so it makes sense to try to merge FIN with
-     * last ACK, hence this TCP_CORK ! But we only do this with fast
+     * last ACK, hence this MSG_MORE ! But we only do this with fast
      * close enabled, this allows us to disable the feature by default.
      */
-    if (arg_fast_close && obj->local_port)
-	    setsockopt(fd, SOL_TCP, TCP_CORK, (char *) &one, sizeof(one));
-#endif
+    data = send(fd, req, r-req, MSG_DONTWAIT | MSG_NOSIGNAL | ((arg_fast_close && obj->local_port) ? MSG_MORE : 0));
+#else
     data = send(fd, req, r-req, MSG_DONTWAIT | MSG_NOSIGNAL);
 #endif
 
@@ -1621,7 +1619,7 @@ int EventWrite(int fd) {
     /* la requete est maintenant prete */
     FD_SET(fd, StaticReadEvent);
     FD_CLR(fd, StaticWriteEvent);
-#ifdef TCP_CORK
+#ifdef MSG_MORE
     /* we can and must shutdown write if we use cork, see explanation above */
     if (arg_fast_close && obj->local_port) {
 	    shutdown(fd, SHUT_WR);
