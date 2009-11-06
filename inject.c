@@ -97,6 +97,14 @@
 #define TCP_NODELAY	1
 #endif
 
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL	0
+#endif
+
+#ifndef MSG_MORE
+#define MSG_MORE	0
+#endif
+
 #define METH_NONE	0
 #define METH_GET	1
 #define METH_POST	2
@@ -1587,26 +1595,23 @@ int EventWrite(int fd) {
 	obj->vars = NULL;
     }
     
-#ifndef MSG_NOSIGNAL
-    {
+    if (!MSG_NOSIGNAL) {
 	int ldata = sizeof(data);
 	getsockopt(fd, SOL_SOCKET, SO_ERROR, &data, &ldata);
 	if (data)
 	    data = -1;
 	else
 	    data = send(fd, req, r-req, MSG_DONTWAIT);
+    } else {
+	    /* If we force binding to a local port, we have SO_REUSEADDR set,
+	     * so we're not annoyed with local TIME_WAIT sockets. Thus, we can
+	     * send a fast shutdown, so it makes sense to try to merge FIN with
+	     * last ACK, hence this MSG_MORE ! But we only do this with fast
+	     * close enabled, this allows us to disable the feature by default.
+	     */
+	    data = send(fd, req, r-req, MSG_DONTWAIT | MSG_NOSIGNAL |
+			((MSG_MORE && arg_fast_close && obj->local_port) ? MSG_MORE : 0));
     }
-#elif MSG_MORE
-    /* If we force binding to a local port, we have SO_REUSEADDR set,
-     * so we're not annoyed with local TIME_WAIT sockets. Thus, we can
-     * send a fast shutdown, so it makes sense to try to merge FIN with
-     * last ACK, hence this MSG_MORE ! But we only do this with fast
-     * close enabled, this allows us to disable the feature by default.
-     */
-    data = send(fd, req, r-req, MSG_DONTWAIT | MSG_NOSIGNAL | ((arg_fast_close && obj->local_port) ? MSG_MORE : 0));
-#else
-    data = send(fd, req, r-req, MSG_DONTWAIT | MSG_NOSIGNAL);
-#endif
 
     if (unlikely(data == -1)) {
 	if (errno != EAGAIN) {
@@ -1619,12 +1624,12 @@ int EventWrite(int fd) {
     /* la requete est maintenant prete */
     FD_SET(fd, StaticReadEvent);
     FD_CLR(fd, StaticWriteEvent);
-#ifdef MSG_MORE
+
     /* we can and must shutdown write if we use cork, see explanation above */
-    if (arg_fast_close && obj->local_port) {
+    if (MSG_MORE && arg_fast_close && obj->local_port) {
 	    shutdown(fd, SHUT_WR);
     }
-#endif
+
     nbactconn++; /* we are connected, let's account it */
     return 0;
 }
@@ -1648,18 +1653,10 @@ int EventRead(int fd) {
 
 	if (obj->buf + BUFSIZE <= obj->read) { /* on ne stocke pas les data dépassant le buffer */
             int readsz = sizeof(trash);
-#ifndef MSG_NOSIGNAL
-	    ret=recv(fd, trash, readsz,0);  /* lire les data mais ne pas les stocker */
-#else
 	    ret=recv(fd, trash, readsz,MSG_NOSIGNAL/*|MSG_WAITALL*/);  /* lire les data mais ne pas les stocker */
-#endif
 	} else {
             int readsz = BUFSIZE - (obj->read - obj->buf);
-#ifndef MSG_NOSIGNAL
-	    ret=recv(fd, obj->read, readsz, 0); /* lire et stocker les data */
-#else
 	    ret=recv(fd, obj->read, readsz, MSG_NOSIGNAL/*|MSG_WAITALL*/); /* lire et stocker les data */
-#endif
 	    if (ret > 0)
 		obj->read += ret;
 	}
