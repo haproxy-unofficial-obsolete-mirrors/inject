@@ -70,6 +70,7 @@
 #include <unistd.h>
 #include <string.h>
 #include <ctype.h>
+#include <sys/mman.h>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -261,8 +262,6 @@ int nbconn=0;
 int nbactconn=0;
 int clientid=0;
 int nbactcli=0;
-int shmid=0;
-char *shmaddr=NULL;
 
 /* set to the local_ip list if required */
 static struct local_ip *local_ip_list = NULL;
@@ -2155,20 +2154,28 @@ int main(int argc, char **argv) {
     fdtab = (struct pageobj **)calloc(1,
 		sizeof(struct pageobj *) * (arg_maxsock + 3));
 
+    /* first try mmap(anonymous|shared) */
+    stats = mmap(NULL, sizeof(struct stats)*(1+arg_nbprocs), PROT_READ|PROT_WRITE,
+		 MAP_ANONYMOUS|MAP_SHARED, 0, 0);
 
-    shmid=shmget(IPC_PRIVATE, sizeof(struct stats)*(1+arg_nbprocs), IPC_CREAT);
-    shmaddr=shmat(shmid, NULL, 0);
-    stats=(void *)shmaddr;
-    if (stats == (void *)-1) {
-	stats = (struct stats *)calloc(1+arg_nbprocs, sizeof(struct stats));
-	if (arg_nbprocs > 1) {
-	    printf("shmid = %d, shmaddr = %p, stats = %p\n", shmid, shmaddr, stats);
-	    printf("shmat error, retry as root or do not use multi-process.\n");
-	    exit(1);
-	}
+    if (stats == MAP_FAILED) {
+	    int shmid=0;
+	    char *shmaddr=NULL;
+
+	    shmid=shmget(IPC_PRIVATE, sizeof(struct stats)*(1+arg_nbprocs), IPC_CREAT);
+	    shmaddr=shmat(shmid, NULL, 0);
+	    stats=(void *)shmaddr;
+	    if (stats == (void *)-1) {
+		    stats = (struct stats *)calloc(1+arg_nbprocs, sizeof(struct stats));
+		    if (arg_nbprocs > 1) {
+			    printf("shmid = %d, shmaddr = %p, stats = %p\n", shmid, shmaddr, stats);
+			    printf("shmat error, retry as root or do not use multi-process.\n");
+			    exit(1);
+		    }
+	    }
+	    memset(stats, 0, sizeof(struct stats)*(1+arg_nbprocs));
+	    shmctl(shmid, IPC_RMID, NULL);
     }
-    memset(stats, 0, sizeof(struct stats)*(1+arg_nbprocs));
-    shmctl(shmid, IPC_RMID, NULL);
 
     time(&launch_time); localtime_r(&launch_time, &tm);
     tv_now(&now);
