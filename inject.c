@@ -1958,7 +1958,7 @@ void sighandler(int sig) {
 
 void usage() {
     fprintf(stderr,
-	    "Inject32 - simple HTTP load generator (C) 2000-2009 Willy Tarreau <w@1wt.eu>\n"
+	    "Inject34 - simple HTTP load generator (C) 2000-2009 Willy Tarreau <w@1wt.eu>\n"
 	    "Syntaxe : inject -u <users> -f <scnfile> [-i <iter>] [-d <duration>] [-l] [-r]\n"
 	    "          [-t <timeout>] [-n <maxsock>] [-o <maxobj>] [-a] [-s <starttime>]\n"
 	    "          [-C <cli_at_once>] [-w <waittime>] [-p nbprocs] [-S ip-ip:p-p]*\n"
