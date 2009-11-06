@@ -1988,7 +1988,7 @@ int main(int argc, char **argv) {
     struct rlimit rlim;
     long int deltatime;
     time_t launch_time;
-    struct tm *tm, *tm2;
+    struct tm tm, tm2;
     int t;
     int orig_argc = argc;
     char **orig_argv = argv;
@@ -2170,7 +2170,7 @@ int main(int argc, char **argv) {
     memset(stats, 0, sizeof(struct stats)*(1+arg_nbprocs));
     shmctl(shmid, IPC_RMID, NULL);
 
-    time(&launch_time); tm=localtime(&launch_time);
+    time(&launch_time); localtime_r(&launch_time, &tm);
     tv_now(&now);
     tv_delayfrom(&stoptime, &now, arg_maxtime * 1000);
 
@@ -2199,7 +2199,7 @@ int main(int argc, char **argv) {
     }
     SelectRun();
     tv_now(&now);
-    tm2=localtime(&now.tv_sec);
+    localtime_r(&now.tv_sec, &tm2);
 
     show_stats(NULL);
     deltatime = (tv_delta(&now, &starttime)?:1);
@@ -2215,11 +2215,11 @@ int main(int argc, char **argv) {
 	   stats[0].totalerr, stats[0].totaltout,
            stats[0].moy_htime, stats[0].moy_ptime,
 	   (long)launch_time,
-           tm->tm_mday, mois[tm->tm_mon], tm->tm_year+1900,
-           tm->tm_hour, tm->tm_min, tm->tm_sec,
+           tm.tm_mday, mois[tm.tm_mon], tm.tm_year+1900,
+           tm.tm_hour, tm.tm_min, tm.tm_sec,
 	   (long)now.tv_sec,
-           tm2->tm_mday, mois[tm2->tm_mon], tm2->tm_year+1900,
-           tm2->tm_hour, tm2->tm_min, tm2->tm_sec);
+           tm2.tm_mday, mois[tm2.tm_mon], tm2.tm_year+1900,
+           tm2.tm_hour, tm2.tm_min, tm2.tm_sec);
     printf("Ligne de commande : ");
     while (orig_argc--) {
 	printf("%s ", *orig_argv++);
