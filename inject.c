@@ -1,5 +1,5 @@
 /*
- * Injecteur HTTP simple (C) 2000-2009 Willy Tarreau <willy@ant-computing.com>
+ * Injecteur HTTP simple (C) 2000-2011 Willy Tarreau <willy@ant-computing.com>
  * Utilisation et redistribution soumises a la licence GPL.
  *
  * Compilation :
@@ -2031,7 +2031,7 @@ void sighandler(int sig) {
 
 void usage() {
     fprintf(stderr,
-	    "Inject34 - simple HTTP load generator (C) 2000-2009 Willy Tarreau <w@1wt.eu>\n"
+	    "Inject35 - simple HTTP load generator (C) 2000-2011 Willy Tarreau <w@1wt.eu>\n"
 	    "Syntaxe : inject -u <users> -f <scnfile> [-i <iter>] [-d <duration>] [-l] [-r]\n"
 	    "          [-t <timeout>] [-n <maxsock>] [-o <maxobj>] [-a] [-s <starttime>]\n"
 	    "          [-C <cli_at_once>] [-w <waittime>] [-p nbprocs] [-S ip-ip:p-p]* [-N]\n"
