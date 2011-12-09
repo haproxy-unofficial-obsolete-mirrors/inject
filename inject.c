@@ -105,6 +105,50 @@
 #define MSG_MORE	0
 #endif
 
+#ifdef ENABLE_SPLICE
+#ifndef F_SETPIPE_SZ
+#define F_SETPIPE_SZ (1024 + 7)
+#endif
+
+#ifndef __NR_splice
+#if defined(__x86_64__)
+#define __NR_splice             275
+#define __NR_tee                276
+#define __NR_vmsplice           278
+#elif defined (__i386__)
+#define __NR_splice             313
+#define __NR_tee                315
+#define __NR_vmsplice           316
+#elif defined (__arm__)
+#define __NR_splice             340
+#define __NR_tee                342
+#define __NR_vmsplice           343
+#endif /* $arch */
+#endif /* __NR_splice */
+
+#ifndef SPLICE_F_NONBLOCK
+#define SPLICE_F_MOVE     1
+#define SPLICE_F_NONBLOCK 2
+#define SPLICE_F_MORE     4
+
+#ifndef _syscall4
+#define _syscall4(tr, nr, t1, n1, t2, n2, t3, n3, t4, n4)  \
+        inline tr nr(t1 n1, t2 n2, t3 n3, t4 n4) {         \
+                return syscall(__NR_##nr, n1, n2, n3, n4); \
+        }
+#endif
+#ifndef _syscall6
+#define _syscall6(tr, nr, t1, n1, t2, n2, t3, n3, t4, n4, t5, n5, t6, n6) \
+        inline tr nr(t1 n1, t2 n2, t3 n3, t4 n4, t5 n5, t6 n6) {          \
+                return syscall(__NR_##nr, n1, n2, n3, n4, n5, n6);        \
+        }
+#endif
+static _syscall6(int, splice, int, fdin, loff_t *, off_in, int, fdout, loff_t *, off_out, size_t, len, unsigned long, flags);
+static _syscall4(long, vmsplice, int, fd, const struct iovec *, iov, unsigned long, nr_segs, unsigned int, flags);
+static _syscall4(long, tee, int, fd_in, int, fd_out, size_t, len, unsigned int, flags);
+#endif
+#endif
+
 #define METH_NONE	0
 #define METH_GET	1
 #define METH_POST	2
@@ -259,6 +303,7 @@ char *arg_sourceaddr = NULL;
 int arg_random_delay = 0;
 int arg_fast_connect = 0;
 int arg_fast_close = 0;
+int arg_use_splice = 0;
 int arg_regular_time = 0;
 static int arg_timeout = 0;
 static int arg_log = 0, arg_abs_time = 0;
@@ -298,6 +343,11 @@ struct stats {
 char trash[TRASHSIZE];
 static struct timeval starttime = {0,0};
 static struct timeval stoptime = {0,0};
+
+int master_pipe[2]; /* pipe used by splice() */
+int pipe_count = 0;
+int dev_null_fd=0;
+int pipesize = TRASHSIZE;
 
 int maxfd = 0;
 int thr = 0;
@@ -1652,8 +1702,31 @@ int EventRead(int fd) {
 	}
 
 	if (obj->buf + BUFSIZE <= obj->read) { /* on ne stocke pas les data dépassant le buffer */
-            int readsz = sizeof(trash);
-	    ret=recv(fd, trash, readsz,MSG_NOSIGNAL/*|MSG_WAITALL*/);  /* lire les data mais ne pas les stocker */
+		int readsz;
+
+#ifdef ENABLE_SPLICE
+		if (arg_use_splice) {
+			/* try to send useless data directly to /dev/null */
+			if (pipe_count) {
+				/* first try to flush pending data from the pipe even though unlikely */
+				readsz = splice(master_pipe[0], NULL, dev_null_fd, NULL, pipe_count, SPLICE_F_NONBLOCK);
+				if (readsz > 0)
+					pipe_count -= readsz;
+			}
+			ret = splice(fd, NULL, master_pipe[1], NULL, pipesize, SPLICE_F_NONBLOCK);
+			if (ret > 0) {
+				pipe_count += ret;
+				readsz = splice(master_pipe[0], NULL, dev_null_fd, NULL, pipe_count, SPLICE_F_NONBLOCK);
+				if (readsz > 0)
+					pipe_count -= readsz;
+				//maxloops = 0; // don't loop any more, we'd hurt other connections.
+			}
+		} else
+#endif
+		{
+			readsz = sizeof(trash);
+			ret=recv(fd, trash, readsz,MSG_NOSIGNAL/*|MSG_WAITALL*/);  /* lire les data mais ne pas les stocker */
+		}
 	} else {
             int readsz = BUFSIZE - (obj->read - obj->buf);
 	    ret=recv(fd, obj->read, readsz, MSG_NOSIGNAL/*|MSG_WAITALL*/); /* lire et stocker les data */
@@ -1961,7 +2034,7 @@ void usage() {
 	    "Inject34 - simple HTTP load generator (C) 2000-2009 Willy Tarreau <w@1wt.eu>\n"
 	    "Syntaxe : inject -u <users> -f <scnfile> [-i <iter>] [-d <duration>] [-l] [-r]\n"
 	    "          [-t <timeout>] [-n <maxsock>] [-o <maxobj>] [-a] [-s <starttime>]\n"
-	    "          [-C <cli_at_once>] [-w <waittime>] [-p nbprocs] [-S ip-ip:p-p]*\n"
+	    "          [-C <cli_at_once>] [-w <waittime>] [-p nbprocs] [-S ip-ip:p-p]* [-N]\n"
 	    "          [-H \"<header>\"]* [-T <thktime>] [-G <URL>] [-P <nbpages>] [-R] [-F]\n"
 	    "- users    : nombre de clients simultanes (=nb d'instances du scenario)\n"
 	    "- iter     : nombre maximal d'iterations a effectuer par client\n"
@@ -2021,6 +2094,10 @@ int main(int argc, char **argv) {
 		arg_fast_connect = 1;
 	    else if (*flag == 'c')
 		arg_fast_close = 1;
+#ifdef ENABLE_SPLICE
+	    else if (*flag == 'N')
+		arg_use_splice = 1;
+#endif
 	    else { /* 2+ args */
 		argv++; argc--;
 		if (argc == 0)
@@ -2185,11 +2262,33 @@ int main(int argc, char **argv) {
 
     signal(SIGINT, sighandler);
 
+#ifdef ENABLE_SPLICE
+    if (arg_use_splice) {
+	if ((dev_null_fd = open("/dev/null", O_WRONLY)) < 0) {
+		fprintf(stderr, "[inject] Cannot open /dev/null\n");
+		exit(1);
+	}
+    }
+#endif
+
     if (arg_nbprocs > 1) {
 
         for (t = 1; t <= arg_nbprocs; t++) {
 	    thr=t;
 	    if (fork() == 0) {
+#ifdef ENABLE_SPLICE
+		    if (arg_use_splice) {
+			    int total, ret;
+
+			    if (pipe(master_pipe) < 0) {
+				    fprintf(stderr, "[inject] Failed to create pipes for splice\n");
+				    exit(1);
+			    }
+	    
+			    fcntl(master_pipe[0], F_SETPIPE_SZ, pipesize * 5 / 4);
+		    }
+#endif
+
 		/* those threads don't collect stats */
 		arg_stattime = 0;
 		active_thread=1;
@@ -2206,6 +2305,21 @@ int main(int argc, char **argv) {
 	active_thread=1;
 	thr = 1;
     }
+
+
+#ifdef ENABLE_SPLICE
+    if (arg_use_splice) {
+	int total, ret;
+
+	if (pipe(master_pipe) < 0) {
+	    fprintf(stderr, "[inject] Failed to create pipes for splice\n");
+	    exit(1);
+	}
+	    
+	fcntl(master_pipe[0], F_SETPIPE_SZ, pipesize * 5 / 4);
+    }
+#endif
+
     SelectRun();
     tv_now(&now);
     localtime_r(&now.tv_sec, &tm2);
