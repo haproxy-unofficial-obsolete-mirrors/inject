@@ -1697,11 +1697,19 @@ int EventRead(int fd) {
 
     do {
 	moretoread = 0;
+#ifndef DONT_ANALYSE_HTTP_HEADERS
 	if (obj->buf == NULL) { /* pas encore alloué */
 	    obj->read = obj->buf = (char *)alloc_pool(buffer);
 	}
 
-	if (obj->buf + BUFSIZE <= obj->read) { /* on ne stocke pas les data dépassant le buffer */
+	if (obj->read < obj->buf + BUFSIZE) { /* on ne stocke que les data qui tiennent dans le buffer */
+		int readsz = BUFSIZE - (obj->read - obj->buf);
+		ret=recv(fd, obj->read, readsz, MSG_NOSIGNAL/*|MSG_WAITALL*/); /* lire et stocker les data */
+		if (ret > 0)
+			obj->read += ret;
+	} else
+#endif
+	{
 		int readsz;
 
 #ifdef ENABLE_SPLICE
@@ -1727,11 +1735,6 @@ int EventRead(int fd) {
 			readsz = sizeof(trash);
 			ret=recv(fd, trash, readsz,MSG_NOSIGNAL/*|MSG_WAITALL*/);  /* lire les data mais ne pas les stocker */
 		}
-	} else {
-            int readsz = BUFSIZE - (obj->read - obj->buf);
-	    ret=recv(fd, obj->read, readsz, MSG_NOSIGNAL/*|MSG_WAITALL*/); /* lire et stocker les data */
-	    if (ret > 0)
-		obj->read += ret;
 	}
 
 	if (ret > 0) {
