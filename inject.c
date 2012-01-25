@@ -368,6 +368,8 @@ void **pool_pageobj = NULL,
     **pool_str = NULL,
     **pool_vars = NULL;
 
+char *cmd_line; /* this contain the original command line for repporting */
+
 /*****  prototypes **********************************************/
 void destroyclient(struct client *client, struct client *prev);
 int EventRead(int fd);
@@ -2100,8 +2102,8 @@ int main(int argc, char **argv) {
     time_t launch_time;
     struct tm tm, tm2;
     int t;
-    int orig_argc = argc;
-    char **orig_argv = argv;
+    int cmd_line_len = 0;
+    char *p;
     char *mois[12]={"Jan","Fev","Mar","Avr","Mai","Juin",
                     "Juil","Aou","Sep","Oct","Nov","Dec"};
 
@@ -2109,6 +2111,25 @@ int main(int argc, char **argv) {
 	fprintf(stderr,"Erreur: recompiler avec pour que sizeof(int)=%d\n",sizeof(int)*8);
 	exit(1);
     }
+
+    /* count final size of the command line */
+    for (t=0; t<argc; t++)
+	cmd_line_len += strlen(argv[t]) + 1;
+    
+    /* get memory for the command line storage */
+    cmd_line = calloc(cmd_line_len, 1);
+
+    /* copy command line */
+    p = cmd_line;
+    for (t=0; t<argc; t++) {
+	cmd_line_len = strlen(argv[t]);
+	memcpy(p, argv[t], cmd_line_len);
+	p += cmd_line_len;
+	*p = ' ';
+	p++;
+    }
+    p--;
+    *p = '\0';
 
     argc--; argv++;
     while (argc > 0) {
@@ -2382,11 +2403,7 @@ int main(int argc, char **argv) {
 	   (long)now.tv_sec,
            tm2.tm_mday, mois[tm2.tm_mon], tm2.tm_year+1900,
            tm2.tm_hour, tm2.tm_min, tm2.tm_sec);
-    printf("Ligne de commande : ");
-    while (orig_argc--) {
-	printf("%s ", *orig_argv++);
-    }
-    putchar('\n');
+    printf("Ligne de commande : %s\n", cmd_line);
     return 0;
 }
 
