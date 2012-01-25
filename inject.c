@@ -314,12 +314,14 @@ static char *arg_geturl = NULL;
 int active_thread = 0;
 
 static struct timeval now={0,0};
+static struct timeval ramp_start={0,0};
 static int one = 1;
 static int zero = 0;
 int nbconn=0;
 int nbactconn=0;
 int clientid=0;
 int nbactcli=0;
+int ramp_step=0;
 
 /* set to the local_ip list if required */
 static struct local_ip *local_ip_list = NULL;
@@ -948,6 +950,16 @@ void destroyclient(struct client *client, struct client *prev) {
 
     nbactcli--;
 
+    /* dynamically compute the number of clients if the step size is > 1 */
+    if (arg_slowstart && arg_stepsize > 1 && nbclients < ramp_step + arg_stepsize) {
+	    nbclients = arg_stepsize * 10 * tv_remain(&ramp_start, &now) / arg_slowstart;
+	    if (nbclients >= arg_stepsize)
+		    nbclients = arg_stepsize;
+	    nbclients += ramp_step;
+	    if (nbclients < 1)
+		    nbclients = 1;
+    }
+
     while (nbactcli < nbclients) {
 	if ((arg_maxiter > 0) && (stats[thr].iterations >= arg_maxiter)) {
 		if (nbactcli == 0)
@@ -1142,21 +1154,24 @@ static inline int injecteur(void *arg) {
 	if (arg_slowstart == 0)
 	    nbclients = arg_nbclients; /* no soft start, all clients at once */
 	else {
-	    if (nbclients == 0) {
+	    if (ramp_step == -1) {
 		SETNOW(&next); /* base for next step computation */
 		tv_delayfrom(&next, &next, arg_slowstart); /* next time we add that many clients */
-		nbclients += arg_stepsize;
+		ramp_start = now;
+		ramp_step = 0;
 	    }
 	    else {
 		unsigned long times;
 		delay = tv_remain(&now, &next);
 		if (!delay) {
-			nbclients += arg_stepsize;
 			tv_delayfrom(&next, &next, arg_slowstart);
+			ramp_start = now;
+			ramp_step += arg_stepsize;
 		}
 	    }
-	    if (nbclients > arg_nbclients)
-		    nbclients = arg_nbclients;
+
+	    if (ramp_step >= arg_nbclients)
+		    ramp_step = arg_nbclients;
 	    else
 		    delay = -1;
 	    delay = tv_remain(&now, &next);
@@ -1164,6 +1179,24 @@ static inline int injecteur(void *arg) {
     }
     else
 	delay = -1;
+
+    if (arg_slowstart && nbclients < ramp_step + arg_stepsize) {
+	    int rem = tv_remain(&ramp_start, &now);
+
+	    if (10*rem < arg_slowstart) {
+		    nbclients = arg_stepsize * 10 * rem / arg_slowstart;
+		    delay = delay < 10 ? delay : 10; // 10ms max
+	    }
+	    else
+		    nbclients = arg_stepsize;
+
+	    if (nbclients >= arg_stepsize)
+		    nbclients = arg_stepsize;
+	    nbclients += ramp_step;
+    }
+
+    if (nbclients < 1)
+	    nbclients = 1;
 
     /* try to get as many clients as required */
     while ((nbactcli < nbclients) && (onemoreclient() != 0));
@@ -2322,6 +2355,9 @@ int main(int argc, char **argv) {
 	fcntl(master_pipe[0], F_SETPIPE_SZ, pipesize * 5 / 4);
     }
 #endif
+
+    ramp_start = now;
+    ramp_step = -1;
 
     SelectRun();
     tv_now(&now);
