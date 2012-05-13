@@ -1089,7 +1089,7 @@ int show_stats(void *arg) {
 
 	    if (lines>1) {
 		if (arg_log) {
-		    fprintf(stdout,"%7ld %5ld %7ld %7ld %5ld  %5ld %5ld %9lld %8lld %5ld %5ld %5ld %5ld %03.1f %3.1f %03.1f %5d %6d\n",
+		    fprintf(stdout,"%7ld %5ld %7ld %7ld %5ld  %5ld %5ld %9lld %8lld %5ld %5ld %5ld %5ld %03.1f %3.1f %03.1f %5ld %6ld\n",
 			    arg_abs_time ? now.tv_sec + (now.tv_usec >= 500000) : totaltime, deltatime,
 			    stats[0].iterations,
 			    stats[0].totalhits, stats[0].stat_hits,
@@ -1668,7 +1668,7 @@ int EventWrite(int fd) {
 	if (global_headers)
 	    r+=sprintf(r, "%s", global_headers);
 	if (obj->vars) {		
-	    r+=sprintf(r,"Content-length: %d\r\n\r\n%s", strlen(obj->vars), obj->vars);
+	    r+=sprintf(r,"Content-length: %d\r\n\r\n%s", (int)strlen(obj->vars), obj->vars);
 	}
 	else
 	    r+=sprintf(r,"\r\n");
@@ -2108,7 +2108,7 @@ int main(int argc, char **argv) {
                     "Juil","Aou","Sep","Oct","Nov","Dec"};
 
     if (1<<INTBITS != sizeof(int)*8) {
-	fprintf(stderr,"Erreur: recompiler avec pour que sizeof(int)=%d\n",sizeof(int)*8);
+	fprintf(stderr,"Erreur: recompiler avec pour que sizeof(int)=%ld\n",sizeof(int)*8);
 	exit(1);
     }
 
