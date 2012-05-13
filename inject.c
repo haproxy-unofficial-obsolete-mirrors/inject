@@ -1715,6 +1715,12 @@ int EventWrite(int fd) {
 	    shutdown(fd, SHUT_WR);
     }
 
+#ifdef TCP_QUICKACK
+    /* we need to re-enable quick ACKs here so that we flush sender's buffers ASAP */
+    if (arg_fast_connect)
+	    setsockopt(fd, SOL_TCP, TCP_QUICKACK, (char *) &one, sizeof(zero));
+#endif
+
     nbactconn++; /* we are connected, let's account it */
     return 0;
 }
