@@ -75,6 +75,7 @@
 #include <unistd.h>
 #include <string.h>
 #include <ctype.h>
+#include <limits.h>
 #include <sys/mman.h>
 #include <sys/time.h>
 #include <sys/types.h>
