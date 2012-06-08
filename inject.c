@@ -1773,8 +1773,11 @@ int EventRead(int fd) {
 		} else
 #endif
 		{
-			readsz = sizeof(trash);
-			ret=recv(fd, trash, readsz,MSG_NOSIGNAL/*|MSG_WAITALL*/);  /* lire les data mais ne pas les stocker */
+#if defined(ENABLE_TRUNC)
+			ret = recv(fd, NULL, INT_MAX, MSG_NOSIGNAL | MSG_TRUNC);  /* détruire les data sans les stocker */
+#else
+			ret = recv(fd, trash, sizeof(trash), MSG_NOSIGNAL/*|MSG_WAITALL*/);  /* lire les data mais ne pas les stocker */
+#endif
 		}
 	}
 
