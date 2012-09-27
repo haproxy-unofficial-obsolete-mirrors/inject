@@ -346,6 +346,7 @@ struct stats {
 char trash[TRASHSIZE];
 static struct timeval starttime = {0,0};
 static struct timeval stoptime = {0,0};
+const struct linger nolinger = { .l_onoff = 1, .l_linger = 0 };
 
 int master_pipe[2]; /* pipe used by splice() */
 int pipe_count = 0;
@@ -892,6 +893,8 @@ void destroypage(struct page *page) {
 	if (fd > 0) {
 	    put_free_port(page->client->addr, obj->local_port, thr-1);
 	    obj->local_port = 0;
+	    setsockopt(fd, SOL_SOCKET, SO_LINGER,
+		       (struct linger *) &nolinger, sizeof(struct linger));
 	    close(fd);
 	    nbconn--;
 	    stats[thr].aborted++;
@@ -1387,6 +1390,9 @@ void SelectRun() {
 
 		      put_free_port(fdtab[fd]->page->client->addr, fdtab[fd]->local_port, thr-1);
 		      fdtab[fd]->local_port = 0;
+		      if (arg_fast_close)
+		            setsockopt(fd, SOL_SOCKET, SO_LINGER,
+		      		 (struct linger *) &nolinger, sizeof(struct linger));
 		      close(fd);
 		      nbconn--;
 		      fdtab[fd]->page->objleft--;
@@ -1695,8 +1701,9 @@ int EventWrite(int fd) {
 	     * last ACK, hence this MSG_MORE ! But we only do this with fast
 	     * close enabled, this allows us to disable the feature by default.
 	     */
+	    /* FIXME: this does not work often unfortunately, let's disable this */
 	    data = send(fd, req, r-req, MSG_DONTWAIT | MSG_NOSIGNAL |
-			((MSG_MORE && arg_fast_close && obj->local_port) ? MSG_MORE : 0));
+			((0 && MSG_MORE && arg_fast_close && obj->local_port) ? MSG_MORE : 0));
     }
 
     if (unlikely(data == -1)) {
@@ -1712,7 +1719,7 @@ int EventWrite(int fd) {
     FD_CLR(fd, StaticWriteEvent);
 
     /* we can and must shutdown write if we use cork, see explanation above */
-    if (MSG_MORE && arg_fast_close && obj->local_port) {
+    if (0 && MSG_MORE && arg_fast_close && obj->local_port) {
 	    shutdown(fd, SHUT_WR);
     }
 
