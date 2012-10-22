@@ -1640,9 +1640,9 @@ int EventWrite(int fd) {
 	}
 
 	r = str_add(r,
-		    " HTTP/1.0\r\n"
-		    "User-Agent: " USER_AGENT "\r\n"
+		    " HTTP/1.1\r\n"
 		    "Connection: close\r\n"
+		    "User-Agent: " USER_AGENT "\r\n"
 		    "Host: "
 		    );
 
