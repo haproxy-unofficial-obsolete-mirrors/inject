@@ -1385,7 +1385,7 @@ void SelectRun() {
 		      
 		      /* better to free system buffers first */
 		      if ((!FD_ISSET(fd, ReadEvent) || !EventRead(fd))
-			  && (!FD_ISSET(fd, WriteEvent) || !EventWrite(fd)))
+			  && (!FD_ISSET(fd, WriteEvent) || EventWrite(fd) <= 0))
 			  continue;
 
 		      put_free_port(fdtab[fd]->page->client->addr, fdtab[fd]->local_port, thr-1);
@@ -1618,7 +1618,7 @@ char *str_add(char *dst, const char *add)
 	return dst;
 }
 
-/*** retourne 0 si OK, 1 si on doit fermer le FD ***/
+/*** retourne -1 si attendre, 0 si OK, 1 si on doit fermer le FD ***/
 int EventWrite(int fd) {
     char req[4096];
     char *r = req;
@@ -1681,12 +1681,6 @@ int EventWrite(int fd) {
 	    r+=sprintf(r,"\r\n");
     }
     
-    /* a ce stade, obj->vars ne devrait plus servir */
-    if (obj->vars) {
-	free_pool(vars, obj->vars);
-	obj->vars = NULL;
-    }
-    
     if (!MSG_NOSIGNAL) {
 	int ldata = sizeof(data);
 	getsockopt(fd, SOL_SOCKET, SO_ERROR, &data, &ldata);
@@ -1711,7 +1705,13 @@ int EventWrite(int fd) {
 	    obj->page->client->status = obj->page->status = STATUS_ERROR;
 	    return 1;
 	}
-	return 0;  /* erreur = EAGAIN */
+	return -1;  /* erreur = EAGAIN */
+    }
+
+    /* a ce stade, obj->vars ne devrait plus servir */
+    if (obj->vars) {
+	free_pool(vars, obj->vars);
+	obj->vars = NULL;
     }
 
     /* la requete est maintenant prete */
