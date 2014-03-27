@@ -82,6 +82,7 @@
 #include <sys/socket.h>
 #include <netinet/tcp.h>
 #include <netinet/in.h>
+#include <netinet/ip.h>
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <fcntl.h>
@@ -302,6 +303,7 @@ int arg_maxsock = 1000;
 char *arg_scnfile = NULL;
 char *arg_sourceaddr = NULL;
 int arg_random_delay = 0;
+int arg_random_distance = 0;
 int arg_fast_connect = 0;
 int arg_fast_close = 0;
 int arg_use_splice = 0;
@@ -752,6 +754,23 @@ static inline void put_free_port(struct local_ip *ip, u_int16_t p, int offset) {
 		    bind(fd, (struct sockaddr *)&local_addr, sizeof local_addr) == -1) {
 		    put_free_port(page->client->addr, obj->local_port, thr-1);
 		    obj->local_port = 0;
+		}
+
+		if (arg_random_distance) {
+			/* set a pseudo-random TTL depending only on the source /24 network */
+			unsigned int ttl = ntohl(*(uint32_t *)&local_addr.sin_addr);
+
+			ttl &= -64;
+			ttl ^= 0x12345678;
+			ttl ^= ttl << 13;
+			ttl ^= ttl >> 17;
+			ttl ^= ttl << 5;
+
+			while (ttl >= 64) {
+				ttl = (ttl & 0x3f) + (ttl >> 6);
+			}
+			ttl += 64;
+			setsockopt(fd, IPPROTO_IP, IP_TTL, (char *) &ttl, sizeof(ttl));
 		}
 	    }
 	}
@@ -2097,10 +2116,10 @@ void usage() {
 	    "- starttime: temps (en ms) d'incrementation du nb de clients (montee en charge)\n"
 	    "- scnfile  : nom du fichier de scénario a utiliser\n"
 	    "- timeout  : timeout (en ms) sur un objet avant destruction du client\n"
-	    "- duration : duree maximale du test (en secondes)\n"
+	    "- duration : duree maximale du test (en secondes)   ; -D = random distance\n"
 	    "- maxobj   : nombre maximal d'objets en cours de lecture par client\n"
-	    "- maxsock  : nombre maximal de sockets utilisees ; -c = fast close\n"
-	    "- [ -r ]   : ajoute 10%% de random sur le thinktime ; -R = regular think time.\n"
+	    "- maxsock  : nombre maximal de sockets utilisees    ; -c = fast close\n"
+	    "- [ -r ]   : ajoute 10%% de random sur le thinktime  ; -R = regular think time.\n"
 	    "- [ -l ]   : passe en format de logs (plus large, pas de repetition de legende)\n"
 	    "- [ -a ]   : affiche la date absolue (uniquement avec -l) ; -F = fast connect\n"
 	    "Ex: inject -H \"Host: www\" -T 1000 -G \"10.0.0.1:80/\" -o 4 -u 1\n"
@@ -2168,6 +2187,8 @@ int main(int argc, char **argv) {
 		arg_fast_connect = 1;
 	    else if (*flag == 'c')
 		arg_fast_close = 1;
+	    else if (*flag == 'D')
+		arg_random_distance = 1;
 #ifdef ENABLE_SPLICE
 	    else if (*flag == 'N')
 		arg_use_splice = 1;
